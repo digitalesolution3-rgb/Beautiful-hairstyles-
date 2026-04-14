@@ -1,0 +1,2483 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="light">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+<meta name="theme-color" content="#B87C74" id="metaTheme"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<title id="pageTitle">Salon — Catalogue</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;0,700;1,400;1,600&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+
+<!-- ═══════════════════════════════════════
+     FIREBASE SDK — v10
+═══════════════════════════════════════ -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, getDocs, addDoc, doc,
+         setDoc, deleteDoc, onSnapshot, serverTimestamp, getDoc }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+try {
+  const cfg = window.SALON_CONFIG?.firebase;
+  if(!cfg?.apiKey || cfg.apiKey === 'VOTRE_API_KEY')
+    throw new Error('Firebase non configuré — mode local');
+  const app = initializeApp(cfg);
+  const db  = getFirestore(app);
+  window.__DB = db;
+  window.__fb = { collection, getDocs, addDoc, doc, setDoc, deleteDoc, onSnapshot, serverTimestamp, getDoc };
+
+  function setDot(ok){
+    const d=document.getElementById('fbDot'), l=document.getElementById('fbLabel');
+    if(d) d.classList.toggle('ok',ok);
+    if(l) l.textContent=ok?'En ligne':'Local';
+  }
+  window._setDot = setDot;
+
+  /* ── CATALOGUE onSnapshot ── */
+  function startCatalog(){
+    onSnapshot(collection(db,'coiffures'), snap=>{
+      const data=[];
+      snap.forEach(d=>data.push({id:d.id,...d.data()}));
+      window.__fbCoiffures=data.length?data:null;
+      window.renderCatalog&&window.renderCatalog();
+      setDot(true);
+    }, err=>{ console.warn('Firebase coiffures:',err.message); window.renderCatalog&&window.renderCatalog(); setDot(false); });
+  }
+
+  /* ── ÉTAPE 1 : Persistance Settings (slides, galerie, ticker, remoteControl) ── */
+  function startSettings(){
+    onSnapshot(doc(db,'salonConfig','settings'), snap=>{
+      if(snap.exists()){
+        const data = snap.data();
+        // Slides
+        if(data.slides && Array.isArray(data.slides)){
+          window.SALON_CONFIG.slides = data.slides;
+          window.buildHero && window.buildHero();
+        }
+        // Galerie
+        if(data.galerie && Array.isArray(data.galerie)){
+          window.SALON_CONFIG.galerie = data.galerie;
+          window.buildGalerie && window.buildGalerie();
+          if(window.__adminGalerieOpen) window.renderAdminGalerie && window.renderAdminGalerie();
+        }
+        // Ticker
+        if(data.ticker !== undefined){
+          window.__tickerSettings = data.ticker;
+          window.applyTicker && window.applyTicker(data.ticker);
+        }
+        // Galerie autoPlay
+        if(data.galerieAutoPlay !== undefined){
+          window.__galerieAutoPlay = data.galerieAutoPlay;
+          window.applyGalerieAutoPlay && window.applyGalerieAutoPlay();
+        }
+        // Remote control (galerie scroll synchronisé)
+        if(data.remoteControl){
+          window.__remoteControlEnabled = data.remoteControl.enabled;
+        }
+      }
+      setDot(true);
+    }, err=>{ console.warn('Firebase settings:',err.message); setDot(false); });
+  }
+
+  /* ── ÉTAPE 3 : Remote Scroll onSnapshot ── */
+  function startRemoteScroll(){
+    onSnapshot(doc(db,'salonConfig','remoteCmd'), snap=>{
+      if(!snap.exists()) return;
+      const data = snap.data();
+      if(window.__isAdmin) return; // L'admin ne se contrôle pas lui-même
+      if(data.action === 'gallery_goto' && typeof data.index === 'number'){
+        window.galerieGotoRemote && window.galerieGotoRemote(data.index);
+      }
+    }, err=>{ console.warn('Firebase remoteCmd:',err.message); });
+  }
+
+  /* ── Fonctions Firestore exposées ── */
+  window.fbSaveSettings = async function(key, value){
+    try{
+      await setDoc(doc(db,'salonConfig','settings'), {[key]: value}, {merge:true});
+      return true;
+    } catch(e){ console.error(e); return false; }
+  };
+
+  window.fbSaveResa = async function(resa){
+    try{ await addDoc(collection(db,'reservations'),{...resa,statut:'en_attente',createdAt:serverTimestamp()}); return true; }
+    catch(e){ console.error(e); return false; }
+  };
+  window.fbListenResa = function(cb){
+    return onSnapshot(collection(db,'reservations'), snap=>{
+      const list=[];
+      snap.forEach(d=>list.push({id:d.id,...d.data()}));
+      list.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
+      cb(list);
+    });
+  };
+  window.fbUpdateStatut = async function(id,statut){
+    try{ await setDoc(doc(db,'reservations',id),{statut},{merge:true}); return true; }
+    catch(e){ return false; }
+  };
+  window.fbSaveCoiffure = async function(c){
+    try{
+      const {id,...data}=c;
+      const ref=id?doc(db,'coiffures',id):doc(collection(db,'coiffures'));
+      await setDoc(ref,data,{merge:true}); return true;
+    } catch(e){ return false; }
+  };
+  window.fbDeleteCoiffure = async function(id){
+    try{ await deleteDoc(doc(db,'coiffures',id)); return true; }
+    catch(e){ return false; }
+  };
+
+  /* ── Remote Command (Étape 3) ── */
+  window.fbSendRemoteCmd = async function(cmd){
+    try{
+      await setDoc(doc(db,'salonConfig','remoteCmd'), {...cmd, ts: serverTimestamp()});
+      return true;
+    } catch(e){ return false; }
+  };
+
+  /* ── Hairstyles TV playlist (Étape 4) ── */
+  window.fbSaveTVPlaylist = async function(playlist){
+    try{
+      await setDoc(doc(db,'salonConfig','settings'), {tvPlaylist: playlist}, {merge:true});
+      return true;
+    } catch(e){ return false; }
+  };
+
+  /* ── File d'attente (Étape 5) ── */
+  window.fbListenQueue = function(cb){
+    return onSnapshot(collection(db,'queue'), snap=>{
+      const list=[];
+      snap.forEach(d=>list.push({id:d.id,...d.data()}));
+      list.sort((a,b)=>(a.createdAt?.seconds||0)-(b.createdAt?.seconds||0));
+      cb(list);
+    });
+  };
+  window.fbAddQueue = async function(item){
+    try{ await addDoc(collection(db,'queue'),{...item,createdAt:serverTimestamp()}); return true; }
+    catch(e){ return false; }
+  };
+  window.fbUpdateQueue = async function(id,data){
+    try{ await setDoc(doc(db,'queue',id),data,{merge:true}); return true; }
+    catch(e){ return false; }
+  };
+  window.fbDeleteQueue = async function(id){
+    try{ await deleteDoc(doc(db,'queue',id)); return true; }
+    catch(e){ return false; }
+  };
+
+  /* ── Dashboard stats (Étape 5) ── */
+  window.fbListenStats = function(cb){
+    return onSnapshot(collection(db,'reservations'), snap=>{
+      const stats = { total:0, today:0, enAttente:0, coiffeurs:{}, prestations:{} };
+      const todayStr = new Date().toISOString().split('T')[0];
+      snap.forEach(d=>{
+        const r=d.data();
+        stats.total++;
+        if(r.date===todayStr) stats.today++;
+        if(r.statut==='en_attente') stats.enAttente++;
+        if(r.coiffeur) stats.coiffeurs[r.coiffeur]=(stats.coiffeurs[r.coiffeur]||0)+1;
+        if(r.coiffure) stats.prestations[r.coiffure]=(stats.prestations[r.coiffure]||0)+1;
+      });
+      cb(stats);
+    });
+  };
+
+  document.addEventListener('DOMContentLoaded',()=>{
+    setTimeout(()=>{ startCatalog(); startSettings(); startRemoteScroll(); }, 600);
+  });
+
+} catch(e){
+  console.warn('Mode hors-ligne:',e.message);
+  document.addEventListener('DOMContentLoaded',()=>{ window.renderCatalog&&window.renderCatalog(); });
+}
+</script>
+
+<style>
+/* ═══════════════════════════════════════
+   SALON MIXTE — CSS Premium v3.0
+   Étapes 1–5 intégrées
+═══════════════════════════════════════ */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --rose:#B87C74;--rose2:#D4A09A;--rose3:#F9EEEC;--rose4:#FDF6F5;
+  --blue:#4A90D9;--blue2:#E8F2FC;
+  --gold:#C9A84C;--gold2:#FBF0D6;--gold3:#A07830;
+  --wa:#25D366;--wa2:#128C7E;
+  --dark:#1A1618;--dark2:#2C2527;--mid:#7A6B6D;--muted:#A89899;
+  --lite:#FAF7F4;--white:#FFFFFF;--border:#EDE4E2;--border2:#DDD0CD;
+  --red:#C0392B;--red2:#FDECEA;
+  --green:#27AE60;--green2:#E8F8EF;
+  --orange:#E67E22;--orange2:#FEF3E2;
+  --purple:#7C3AED;--purple2:#EDE9FE;
+  --shadow-sm:0 2px 8px rgba(184,124,116,.08);
+  --shadow:0 4px 20px rgba(184,124,116,.12);
+  --shadow-lg:0 12px 40px rgba(184,124,116,.18);
+  --r-sm:8px;--r:14px;--r-lg:20px;--r-xl:28px;
+  --t:.22s cubic-bezier(.4,0,.2,1);
+}
+[data-theme="dark"]{
+  --dark:#F5F0EE;--dark2:#EDE5E3;--mid:#A89899;--muted:#7A6B6D;
+  --lite:#130F10;--white:#1E1618;--border:#2E2224;--border2:#3D2E30;
+  --rose3:#2A1A18;--rose4:#1F1416;--gold2:#2A2015;--blue2:#0e1f33;--purple2:#1e1040;
+  --shadow-sm:0 2px 8px rgba(0,0,0,.3);--shadow:0 4px 20px rgba(0,0,0,.35);--shadow-lg:0 12px 40px rgba(0,0,0,.45);
+}
+html{scroll-behavior:smooth}
+body{font-family:'DM Sans',sans-serif;background:var(--lite);color:var(--dark);min-height:100vh;transition:background var(--t),color var(--t)}
+img{max-width:100%;display:block}
+input,select,textarea,button{font-family:'DM Sans',sans-serif}
+
+/* ── LOADER ── */
+#loader{position:fixed;inset:0;background:var(--dark2);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;transition:opacity .6s,visibility .6s}
+#loader.hide{opacity:0;visibility:hidden;pointer-events:none}
+.ld-logo{font-family:'Cormorant Garamond',serif;color:#fff;font-size:2.8rem;font-weight:700;letter-spacing:2px}
+.ld-logo em{color:var(--rose2);font-style:italic}
+.ld-sub{color:rgba(255,255,255,.4);font-size:.65rem;letter-spacing:5px;text-transform:uppercase;margin-top:6px}
+.ld-bar{width:160px;height:2px;background:rgba(255,255,255,.12);border-radius:10px;margin-top:28px;overflow:hidden}
+.ld-fill{height:100%;background:linear-gradient(90deg,var(--rose),var(--rose2));animation:lf 1.4s cubic-bezier(.4,0,.2,1) forwards}
+@keyframes lf{from{width:0}to{width:100%}}
+.ld-dots{display:flex;gap:6px;margin-top:16px}
+.ld-dot{width:5px;height:5px;border-radius:50%;background:rgba(255,255,255,.25);animation:ld 1.2s ease infinite}
+.ld-dot:nth-child(2){animation-delay:.2s}.ld-dot:nth-child(3){animation-delay:.4s}
+@keyframes ld{0%,60%,100%{transform:scale(.8);opacity:.25}30%{transform:scale(1.2);opacity:1}}
+
+/* ── TOPBAR ── */
+#topbar{background:var(--dark2);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:56px;position:sticky;top:0;z-index:500;box-shadow:0 2px 12px rgba(0,0,0,.2)}
+[data-theme="dark"] #topbar{background:rgba(18,10,12,.96);backdrop-filter:blur(10px)}
+.t-brand{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.t-mark{width:34px;height:34px;background:linear-gradient(135deg,var(--rose),var(--rose2));border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:1.15rem;flex-shrink:0}
+.t-name{font-family:'Cormorant Garamond',serif;font-size:1.06rem;letter-spacing:.8px;font-weight:700;line-height:1.1}
+.t-name em{color:var(--rose2);font-style:italic}
+.t-actions{display:flex;gap:7px;align-items:center}
+.btn-i{background:rgba(255,255,255,.09);border:1.5px solid rgba(255,255,255,.12);color:#fff;width:38px;height:38px;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:var(--t);flex-shrink:0}
+.btn-i:hover{background:var(--rose);border-color:var(--rose)}
+.btn-i svg{width:18px;height:18px;fill:currentColor}
+.btn-wa{background:linear-gradient(135deg,var(--wa),var(--wa2))!important;border-color:var(--wa)!important;width:auto!important;padding:0 13px;gap:6px;font-size:.74rem;font-weight:700;letter-spacing:.3px}
+.fb-pill{display:inline-flex;align-items:center;gap:5px;font-size:.63rem;padding:4px 9px;border-radius:20px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);color:rgba(255,255,255,.55)}
+.fb-dot{width:6px;height:6px;border-radius:50%;background:#e53935;transition:var(--t)}
+.fb-dot.ok{background:#51cf66}
+
+/* ── HERO ── */
+#hero{position:relative;overflow:hidden;height:52vw;min-height:300px;max-height:430px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px}
+.hero-ss{position:absolute;inset:0;z-index:0}
+.hero-sl{position:absolute;inset:0;background-size:cover;background-position:center;opacity:0;transition:opacity 1.2s ease}
+.hero-sl.active{opacity:1}
+.hero-ss::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(26,10,12,.55) 0%,rgba(26,10,12,.15) 50%,rgba(26,10,12,.7) 100%);z-index:1}
+.hero-c{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center}
+#hero h1{font-family:'Cormorant Garamond',serif;color:#fff;font-size:clamp(1.9rem,6.5vw,3.2rem);line-height:1.1;margin-bottom:6px}
+#hero h1 em{color:var(--rose2);font-style:italic}
+#hero .hero-sub{color:rgba(255,255,255,.5);font-size:.68rem;letter-spacing:4px;text-transform:uppercase}
+.hero-div{width:40px;height:1.5px;background:linear-gradient(90deg,transparent,var(--rose2),transparent);margin:14px auto}
+.hero-tags{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.hero-tag{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.9);padding:5px 13px;border-radius:30px;font-size:.7rem;font-weight:500;backdrop-filter:blur(4px)}
+.hero-loc{display:inline-flex;align-items:center;gap:7px;margin-top:14px;background:linear-gradient(135deg,var(--rose),var(--rose2));color:#fff;font-size:.75rem;font-weight:700;padding:9px 18px;border-radius:30px;border:none;cursor:pointer;text-decoration:none;box-shadow:0 4px 14px rgba(184,124,116,.4);transition:var(--t)}
+.hero-loc:hover{transform:translateY(-2px);box-shadow:0 7px 22px rgba(184,124,116,.5)}
+.hero-loc svg{width:14px;height:14px;fill:currentColor;flex-shrink:0}
+.hero-dots{display:flex;gap:5px;justify-content:center;margin-top:12px;position:relative;z-index:2}
+.hero-dot{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.3);border:none;cursor:pointer;padding:0;transition:all .3s}
+.hero-dot.active{background:var(--rose2);width:20px;border-radius:4px}
+
+/* ── PROMO BANNIÈRE ── */
+#promoBanner{background:linear-gradient(135deg,var(--gold),var(--gold3));color:#fff;text-align:center;padding:9px 16px;font-size:.76rem;font-weight:700;letter-spacing:.3px;display:none;position:relative}
+#promoBanner.show{display:block}
+#promoBanner .promo-close{position:absolute;right:12px;top:50%;transform:translateY(-50%);background:rgba(0,0,0,.2);border:none;color:#fff;width:22px;height:22px;border-radius:50%;cursor:pointer;font-size:.8rem;display:flex;align-items:center;justify-content:center}
+
+/* ═══════════════════════════════════════
+   ÉTAPE 2 — TICKER (bande défilante)
+═══════════════════════════════════════ */
+#tickerBar{background:linear-gradient(90deg,var(--dark2),#3D2527,var(--dark2));color:#fff;overflow:hidden;height:36px;display:none;align-items:center;position:relative;border-top:1px solid rgba(255,255,255,.06);border-bottom:1px solid rgba(255,255,255,.06)}
+#tickerBar.visible{display:flex}
+.ticker-label{flex-shrink:0;background:var(--rose);color:#fff;font-size:.62rem;font-weight:800;letter-spacing:1px;padding:0 12px;height:100%;display:flex;align-items:center;text-transform:uppercase;z-index:2}
+.ticker-track{flex:1;overflow:hidden;position:relative;height:100%;display:flex;align-items:center}
+.ticker-content{white-space:nowrap;font-size:.75rem;font-weight:500;letter-spacing:.3px;animation:tickerScroll 20s linear infinite;display:inline-block;padding-left:100%}
+.ticker-content.speed-slow{animation-duration:35s}
+.ticker-content.speed-fast{animation-duration:10s}
+@keyframes tickerScroll{0%{transform:translateX(0)}100%{transform:translateX(-100%)}}
+#tickerBar:hover .ticker-content{animation-play-state:paused}
+.ticker-sep{display:inline-block;margin:0 20px;color:var(--rose2);opacity:.6}
+
+/* ── GENRE SWITCH ── */
+#genreBar{background:var(--white);border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;justify-content:center;gap:8px;position:sticky;top:56px;z-index:450;box-shadow:var(--shadow-sm)}
+.genre-btn{display:flex;align-items:center;gap:6px;padding:8px 20px;border-radius:30px;border:2px solid var(--border);background:var(--lite);color:var(--mid);font-size:.78rem;font-weight:700;cursor:pointer;transition:var(--t)}
+.genre-btn.active-f{border-color:var(--rose);background:var(--rose3);color:var(--rose)}
+.genre-btn.active-m{border-color:var(--blue);background:var(--blue2);color:var(--blue)}
+.genre-btn.active-all{border-color:var(--gold);background:var(--gold2);color:var(--gold3)}
+.genre-sep{width:1px;height:24px;background:var(--border)}
+
+/* ── TABS CATÉGORIES ── */
+#tabsWrap{background:var(--white);border-bottom:1px solid var(--border);position:sticky;top:102px;z-index:400;box-shadow:var(--shadow-sm)}
+#tabs{display:flex;gap:0;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;padding:0 8px}
+#tabs::-webkit-scrollbar{display:none}
+.tab-btn{flex-shrink:0;padding:12px 16px;border:none;background:none;color:var(--mid);font-size:.78rem;font-weight:600;cursor:pointer;border-bottom:2.5px solid transparent;transition:var(--t);white-space:nowrap;display:flex;align-items:center;gap:5px}
+.tab-btn:hover{color:var(--rose)}
+.tab-btn.active{color:var(--rose);border-bottom-color:var(--rose)}
+
+/* ── CATALOGUE ── */
+#catalogWrap{padding:16px}
+.search-wrap{margin-bottom:16px}
+.search-box{display:flex;align-items:center;gap:10px;background:var(--white);border:1.5px solid var(--border);border-radius:var(--r);padding:10px 14px;box-shadow:var(--shadow-sm)}
+.search-box svg{width:18px;height:18px;fill:var(--muted);flex-shrink:0}
+.search-box input{border:none;background:none;outline:none;color:var(--dark);font-size:.88rem;width:100%}
+.search-box input::placeholder{color:var(--muted)}
+.section-title{font-family:'Cormorant Garamond',serif;font-size:1.35rem;font-weight:700;color:var(--dark);margin-bottom:14px;padding-left:2px}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+.card{background:var(--white);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;transition:var(--t);box-shadow:var(--shadow-sm)}
+.card:hover{transform:translateY(-3px);box-shadow:var(--shadow)}
+.card-img-wrap{position:relative;padding-top:70%;background:var(--rose3)}
+.card-img-wrap img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.card-badge{position:absolute;top:8px;left:8px;background:linear-gradient(135deg,var(--gold),var(--gold3));color:#fff;font-size:.6rem;font-weight:800;padding:3px 9px;border-radius:20px;letter-spacing:.4px;text-transform:uppercase}
+.card-genre{position:absolute;bottom:8px;right:8px;font-size:.6rem;font-weight:700;padding:3px 9px;border-radius:20px;backdrop-filter:blur(4px)}
+.card-genre.f{background:rgba(184,124,116,.85);color:#fff}
+.card-genre.m{background:rgba(74,144,217,.85);color:#fff}
+.card-genre.mf{background:rgba(201,168,76,.85);color:#fff}
+.card-indispo{position:absolute;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center}
+.card-indispo span{background:var(--dark2);color:rgba(255,255,255,.8);font-size:.68rem;font-weight:700;padding:5px 12px;border-radius:20px}
+.card-body{padding:12px}
+.card-name{font-family:'Cormorant Garamond',serif;font-size:1.05rem;font-weight:700;color:var(--dark);margin-bottom:3px;line-height:1.2}
+.card-desc{font-size:.72rem;color:var(--mid);margin-bottom:8px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card-opts{display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap}
+.opt-pill{font-size:.66rem;font-weight:600;padding:3px 9px;border-radius:20px;border:1.5px solid var(--border);color:var(--mid);cursor:pointer;transition:var(--t)}
+.opt-pill.active{border-color:var(--rose);color:var(--rose);background:var(--rose3)}
+.card-meta{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.card-price{font-size:.82rem;font-weight:800;color:var(--rose)}
+.card-duree{display:flex;align-items:center;gap:4px;font-size:.7rem;color:var(--muted)}
+.card-duree svg{width:13px;height:13px;fill:currentColor}
+.card-btns{display:flex;gap:7px}
+.btn-wa-card{flex:1;background:linear-gradient(135deg,var(--rose),var(--rose2));color:#fff;border:none;border-radius:var(--r-sm);padding:8px 10px;font-size:.73rem;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:5px;transition:var(--t)}
+.btn-wa-card:hover{opacity:.88;transform:translateY(-1px)}
+.btn-wa-card svg{width:14px;height:14px;fill:currentColor;flex-shrink:0}
+.btn-info-card{background:var(--lite);border:1.5px solid var(--border);color:var(--mid);border-radius:var(--r-sm);padding:8px 10px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:var(--t)}
+.btn-info-card:hover{border-color:var(--rose);color:var(--rose)}
+.btn-info-card svg{width:15px;height:15px;fill:currentColor}
+
+/* ── ÉQUIPE ── */
+#equipe{padding:20px 16px;border-top:8px solid var(--border)}
+.equipe-title{font-family:'Cormorant Garamond',serif;font-size:1.5rem;font-weight:700;color:var(--dark);margin-bottom:2px}
+.equipe-sub{font-size:.74rem;color:var(--muted);margin-bottom:14px}
+.equipe-scroll{display:flex;gap:12px;overflow-x:auto;scrollbar-width:none;padding:4px 2px 8px}
+.equipe-scroll::-webkit-scrollbar{display:none}
+.coiffeur-card{flex-shrink:0;text-align:center;background:var(--white);border:1.5px solid var(--border);border-radius:var(--r-lg);padding:14px 12px;cursor:pointer;transition:var(--t);min-width:96px}
+.coiffeur-card:hover,.coiffeur-card.selected{border-color:var(--rose);background:var(--rose3);box-shadow:0 4px 14px rgba(184,124,116,.2)}
+.coiffeur-avatar{width:52px;height:52px;border-radius:50%;object-fit:cover;margin:0 auto 7px;border:2px solid var(--rose2)}
+.coiffeur-avatar-placeholder{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,var(--rose3),var(--rose2));display:flex;align-items:center;justify-content:center;font-size:1.5rem;margin:0 auto 7px}
+.coiffeur-name{font-weight:700;font-size:.82rem;color:var(--dark);margin-bottom:2px}
+.coiffeur-spe{font-size:.64rem;color:var(--muted);line-height:1.3}
+.coiffeur-badge{display:inline-block;margin-top:5px;font-size:.6rem;font-weight:700;padding:2px 8px;border-radius:10px}
+.coiffeur-badge.f{background:var(--rose3);color:var(--rose)}
+.coiffeur-badge.m{background:var(--blue2);color:var(--blue)}
+.coiffeur-badge.mf{background:var(--gold2);color:var(--gold3)}
+
+/* ══════════════════════════════════════
+   ÉTAPE 3 — GALERIE AVEC MODES
+══════════════════════════════════════ */
+#galerie{padding:20px 16px;border-top:8px solid var(--border)}
+.gal-title{font-family:'Cormorant Garamond',serif;font-size:1.5rem;font-weight:700;color:var(--dark);margin-bottom:2px}
+.gal-sub{font-size:.74rem;color:var(--muted);margin-bottom:12px}
+.gal-controls{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.gal-filter{display:flex;gap:6px;flex-wrap:wrap}
+.gal-f-btn{padding:6px 14px;border-radius:20px;font-size:.73rem;font-weight:600;border:1.5px solid var(--border);background:var(--lite);color:var(--mid);cursor:pointer;transition:var(--t)}
+.gal-f-btn.active{border-color:var(--rose);background:var(--rose3);color:var(--rose)}
+.gal-mode-btns{display:flex;gap:5px}
+.gal-mode-btn{padding:6px 10px;border-radius:var(--r-sm);font-size:.68rem;font-weight:700;border:1.5px solid var(--border);background:var(--lite);color:var(--mid);cursor:pointer;transition:var(--t);display:flex;align-items:center;gap:4px}
+.gal-mode-btn.active{border-color:var(--rose);background:var(--rose3);color:var(--rose)}
+.gal-mode-btn svg{width:13px;height:13px;fill:currentColor}
+.gal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+.gal-item{cursor:pointer;border-radius:var(--r);overflow:hidden;position:relative;padding-top:100%;background:var(--rose3);transition:var(--t)}
+.gal-item:hover{transform:scale(1.02);box-shadow:var(--shadow)}
+.gal-item-inner{position:absolute;inset:0}
+.gal-item-inner img{width:100%;height:100%;object-fit:cover;transition:transform .4s ease}
+.gal-item:hover .gal-item-inner img{transform:scale(1.06)}
+.gal-label{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(transparent,rgba(26,22,24,.8));color:#fff;padding:16px 8px 6px;font-size:.68rem;font-weight:600}
+.gal-genre-tag{position:absolute;top:6px;right:6px;font-size:.58rem;font-weight:700;padding:2px 7px;border-radius:10px;backdrop-filter:blur(4px)}
+.gal-genre-tag.f{background:rgba(184,124,116,.85);color:#fff}
+.gal-genre-tag.m{background:rgba(74,144,217,.85);color:#fff}
+.gal-genre-tag.mf{background:rgba(201,168,76,.85);color:#fff}
+
+/* ── Galerie Fullscreen Slideshow (Étape 3) ── */
+#galerieSlideshow{position:fixed;inset:0;background:#000;z-index:2000;display:none;flex-direction:column;align-items:center;justify-content:center}
+#galerieSlideshow.open{display:flex}
+.gs-img{width:100%;height:100%;object-fit:contain;position:absolute;inset:0;opacity:0;transition:opacity .6s ease}
+.gs-img.active{opacity:1}
+.gs-overlay{position:absolute;inset:0;z-index:1;pointer-events:none}
+.gs-overlay::after{content:'';position:absolute;inset:0;background:linear-gradient(transparent 70%,rgba(0,0,0,.8))}
+.gs-label{position:absolute;bottom:80px;left:0;right:0;text-align:center;color:#fff;font-family:'Cormorant Garamond',serif;font-size:1.8rem;font-weight:700;z-index:2;text-shadow:0 2px 12px rgba(0,0,0,.5)}
+.gs-counter{position:absolute;top:16px;right:16px;background:rgba(0,0,0,.5);color:#fff;font-size:.72rem;font-weight:700;padding:5px 12px;border-radius:20px;z-index:2;backdrop-filter:blur(4px)}
+.gs-controls{position:absolute;bottom:20px;left:0;right:0;display:flex;align-items:center;justify-content:center;gap:12px;z-index:2}
+.gs-btn{background:rgba(255,255,255,.15);border:1.5px solid rgba(255,255,255,.25);color:#fff;width:44px;height:44px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:var(--t);backdrop-filter:blur(4px)}
+.gs-btn:hover{background:var(--rose);border-color:var(--rose)}
+.gs-btn svg{width:20px;height:20px;fill:currentColor}
+.gs-close{position:absolute;top:16px;left:16px;z-index:3}
+.gs-remote-badge{position:absolute;top:16px;left:50%;transform:translateX(-50%);background:rgba(124,58,237,.8);color:#fff;font-size:.7rem;font-weight:700;padding:5px 14px;border-radius:20px;backdrop-filter:blur(4px);z-index:3;display:none;animation:pulse 2s ease infinite}
+.gs-remote-badge.show{display:block}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+.gs-dots{display:flex;gap:4px;position:absolute;bottom:72px;left:50%;transform:translateX(-50%);z-index:2}
+.gs-dot{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.3);border:none;cursor:pointer;padding:0;transition:all .3s}
+.gs-dot.active{background:var(--rose2);width:18px;border-radius:4px}
+
+/* ── Avant/Après Modal ── */
+#avantApresModal{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:900;display:none;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(6px)}
+#avantApresModal.open{display:flex}
+.aa-box{background:var(--white);border-radius:var(--r-xl);width:100%;max-width:480px;overflow:hidden;box-shadow:var(--shadow-lg)}
+.aa-head{background:var(--dark2);color:#fff;padding:12px 16px;display:flex;align-items:center;justify-content:space-between}
+.aa-head span{font-family:'Cormorant Garamond',serif;font-size:1.1rem;font-weight:700}
+.aa-close{background:rgba(255,255,255,.1);border:none;color:#fff;width:28px;height:28px;border-radius:7px;cursor:pointer;font-size:.9rem;display:flex;align-items:center;justify-content:center}
+.aa-slider-wrap{position:relative;padding-top:70%;background:var(--rose3);overflow:hidden;user-select:none}
+.aa-slider-wrap img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.aa-overlay{position:absolute;inset:0}
+.aa-overlay img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.aa-divider{position:absolute;top:0;bottom:0;width:3px;background:#fff;cursor:ew-resize;box-shadow:0 0 8px rgba(0,0,0,.5);z-index:10}
+.aa-divider::after{content:'⟺';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:#fff;border-radius:50%;width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-size:.8rem;box-shadow:0 2px 8px rgba(0,0,0,.3)}
+.aa-labels{display:flex;justify-content:space-between;padding:8px 12px;font-size:.68rem;font-weight:700;color:var(--mid);letter-spacing:.4px;text-transform:uppercase}
+
+/* ── AVIS CLIENTS ── */
+#avis{padding:20px 16px;border-top:8px solid var(--border)}
+.avis-title{font-family:'Cormorant Garamond',serif;font-size:1.5rem;font-weight:700;color:var(--dark);margin-bottom:2px}
+.avis-sub{font-size:.74rem;color:var(--muted);margin-bottom:14px}
+.avis-scroll{display:flex;gap:12px;overflow-x:auto;scrollbar-width:none;padding:4px 2px 8px;margin-bottom:14px}
+.avis-scroll::-webkit-scrollbar{display:none}
+.avis-card{flex-shrink:0;background:var(--white);border:1px solid var(--border);border-radius:var(--r-lg);padding:16px;max-width:260px;min-width:220px;box-shadow:var(--shadow-sm)}
+.avis-stars{font-size:.95rem;margin-bottom:6px}
+.avis-text{font-size:.8rem;color:var(--dark);line-height:1.5;margin-bottom:8px;font-style:italic}
+.avis-author{display:flex;align-items:center;gap:6px;font-size:.72rem;font-weight:700;color:var(--mid)}
+.avis-author-dot{width:5px;height:5px;border-radius:50%;background:var(--rose)}
+.avis-add-btn{background:var(--lite);border:1.5px solid var(--border);color:var(--mid);padding:10px 20px;border-radius:30px;font-size:.78rem;font-weight:700;cursor:pointer;transition:var(--t);width:100%}
+.avis-add-btn:hover{border-color:var(--rose);color:var(--rose);background:var(--rose3)}
+
+/* ── FILE D'ATTENTE (Étape 5) ── */
+#queueSection{padding:20px 16px;border-top:8px solid var(--border);display:none}
+#queueSection.show{display:block}
+.queue-title{font-family:'Cormorant Garamond',serif;font-size:1.5rem;font-weight:700;color:var(--dark);margin-bottom:2px}
+.queue-sub{font-size:.74rem;color:var(--muted);margin-bottom:14px}
+.queue-board{background:var(--white);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--shadow-sm)}
+.queue-header{background:linear-gradient(135deg,var(--rose),var(--rose2));padding:12px 16px;display:flex;align-items:center;justify-content:space-between}
+.queue-header-title{color:#fff;font-weight:700;font-size:.88rem;display:flex;align-items:center;gap:8px}
+.queue-count-badge{background:rgba(255,255,255,.25);color:#fff;font-size:.68rem;font-weight:800;padding:2px 9px;border-radius:12px}
+.queue-list{padding:0}
+.queue-item{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border);transition:var(--t)}
+.queue-item:last-child{border-bottom:none}
+.queue-item:hover{background:var(--rose4)}
+.queue-pos{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,var(--rose3),var(--rose2));color:var(--rose);font-size:.78rem;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.queue-pos.en_cours{background:linear-gradient(135deg,var(--green2),var(--green));color:#fff}
+.queue-info{flex:1}
+.queue-name{font-size:.86rem;font-weight:700;color:var(--dark)}
+.queue-detail{font-size:.72rem;color:var(--mid);margin-top:1px}
+.queue-status{font-size:.68rem;font-weight:700;padding:3px 10px;border-radius:12px}
+.queue-status.attente{background:var(--orange2);color:var(--orange)}
+.queue-status.en_cours{background:var(--green2);color:var(--green)}
+.queue-empty{text-align:center;padding:28px;color:var(--muted);font-size:.82rem}
+.btn-join-queue{width:100%;margin-top:12px;background:linear-gradient(135deg,var(--rose),var(--rose2));color:#fff;border:none;border-radius:var(--r);padding:12px;font-size:.86rem;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:var(--t);box-shadow:0 4px 14px rgba(184,124,116,.3)}
+.btn-join-queue:hover{opacity:.9;transform:translateY(-1px)}
+
+/* ── LOCALISATION ── */
+#localisation{padding:20px 16px;border-top:8px solid var(--border)}
+.loc-title{font-family:'Cormorant Garamond',serif;font-size:1.5rem;font-weight:700;color:var(--dark);margin-bottom:8px}
+.loc-adresse{font-size:.84rem;color:var(--mid);margin-bottom:16px;line-height:1.5}
+.loc-btns{display:flex;gap:8px;flex-wrap:wrap}
+.btn-maps{display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,var(--rose),var(--rose2));color:#fff;padding:10px 20px;border-radius:30px;font-size:.78rem;font-weight:700;text-decoration:none;transition:var(--t);box-shadow:0 4px 14px rgba(184,124,116,.3)}
+.btn-maps:hover{opacity:.88;transform:translateY(-2px)}
+.btn-maps svg{width:14px;height:14px;fill:currentColor}
+.btn-wa-loc{display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,var(--wa),var(--wa2));color:#fff;padding:10px 20px;border-radius:30px;font-size:.78rem;font-weight:700;border:none;cursor:pointer;text-decoration:none;transition:var(--t)}
+.btn-wa-loc:hover{opacity:.88}
+.btn-wa-loc svg{width:14px;height:14px;fill:currentColor}
+.horaires{font-size:.75rem;color:var(--mid);margin-top:10px}
+
+/* ── MODAL RÉSERVATION ── */
+#resaModal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:800;display:none;align-items:flex-end;justify-content:center;backdrop-filter:blur(3px)}
+#resaModal.open{display:flex}
+.resa-sheet{background:var(--white);border-radius:var(--r-xl) var(--r-xl) 0 0;width:100%;max-width:540px;max-height:90vh;overflow-y:auto;animation:slideUp .3s cubic-bezier(.34,1.56,.64,1)}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+.resa-head{background:linear-gradient(135deg,var(--dark2),#3D2527);color:#fff;padding:16px 20px;display:flex;align-items:center;justify-content:space-between;border-radius:var(--r-xl) var(--r-xl) 0 0}
+.resa-head h3{font-family:'Cormorant Garamond',serif;font-size:1.4rem;font-weight:700;display:flex;align-items:center;gap:8px}
+.resa-head h3 svg{width:20px;height:20px;fill:var(--rose2)}
+.resa-close{background:rgba(255,255,255,.12);border:1.5px solid rgba(255,255,255,.2);color:#fff;width:32px;height:32px;border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:1.1rem;transition:var(--t)}
+.resa-close:hover{background:rgba(255,255,255,.25)}
+.resa-body{padding:20px}
+.resa-preview{display:flex;align-items:center;gap:12px;background:var(--rose4);border:1px solid var(--border);border-radius:var(--r);padding:12px;margin-bottom:18px}
+.resa-preview img{width:56px;height:56px;border-radius:10px;object-fit:cover;flex-shrink:0;background:var(--rose3)}
+.resa-preview-info h4{font-family:'Cormorant Garamond',serif;font-size:1.1rem;font-weight:700;color:var(--dark)}
+.resa-preview-info p{font-size:.75rem;color:var(--mid);margin-top:2px}
+.resa-preview-price{margin-left:auto;font-size:.95rem;font-weight:800;color:var(--rose);white-space:nowrap}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:.75rem;font-weight:700;color:var(--mid);margin-bottom:5px;text-transform:uppercase;letter-spacing:.4px}
+.form-control{width:100%;border:1.5px solid var(--border);border-radius:var(--r-sm);padding:10px 14px;font-size:.88rem;color:var(--dark);background:var(--white);outline:none;transition:var(--t)}
+.form-control:focus{border-color:var(--rose);box-shadow:0 0 0 3px rgba(184,124,116,.12)}
+.form-row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.resa-opt-label{font-size:.75rem;font-weight:700;color:var(--mid);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px}
+.resa-opts{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.resa-opt{padding:7px 14px;border:1.5px solid var(--border);border-radius:30px;font-size:.78rem;font-weight:600;cursor:pointer;transition:var(--t);color:var(--mid);background:var(--lite)}
+.resa-opt.active{border-color:var(--rose);color:var(--rose);background:var(--rose3)}
+.resa-coiffeurs{display:flex;gap:10px;overflow-x:auto;scrollbar-width:none;padding:4px 2px 8px;margin-bottom:14px}
+.resa-coiffeurs::-webkit-scrollbar{display:none}
+.resa-coif-item{flex-shrink:0;text-align:center;cursor:pointer;padding:8px 10px;border-radius:var(--r);border:1.5px solid var(--border);transition:var(--t);min-width:72px}
+.resa-coif-item:hover,.resa-coif-item.selected{border-color:var(--rose);background:var(--rose3)}
+.resa-coif-item img,.resa-coif-item .rci-avatar{width:44px;height:44px;border-radius:50%;object-fit:cover;margin:0 auto 5px}
+.rci-avatar{background:linear-gradient(135deg,var(--rose3),var(--rose2));display:flex;align-items:center;justify-content:center;font-size:1.2rem}
+.resa-coif-item span{font-size:.65rem;font-weight:700;color:var(--dark);display:block}
+.btn-send-wa{width:100%;background:linear-gradient(135deg,var(--wa),var(--wa2));color:#fff;border:none;border-radius:var(--r);padding:14px;font-size:.92rem;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:var(--t);margin-top:6px;letter-spacing:.3px;box-shadow:0 4px 14px rgba(37,211,102,.35)}
+.btn-send-wa:hover{opacity:.92;transform:translateY(-1px);box-shadow:0 7px 22px rgba(37,211,102,.45)}
+.btn-send-wa svg{width:18px;height:18px;fill:currentColor}
+.btn-send-wa-sec{width:100%;background:var(--lite);color:var(--dark);border:1.5px solid var(--border);border-radius:var(--r);padding:12px;font-size:.84rem;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:var(--t);margin-top:8px}
+.btn-send-wa-sec:hover{border-color:var(--rose);color:var(--rose)}
+
+/* ── MODAL AVIS ── */
+#avisModal{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:950;display:none;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(4px)}
+#avisModal.open{display:flex}
+.avis-box{background:var(--white);border-radius:var(--r-xl);width:100%;max-width:420px;padding:28px;box-shadow:var(--shadow-lg)}
+.avis-box h3{font-family:'Cormorant Garamond',serif;font-size:1.4rem;font-weight:700;color:var(--dark);margin-bottom:16px}
+.star-picker{display:flex;gap:6px;margin-bottom:16px}
+.star-picker span{font-size:1.6rem;cursor:pointer;transition:transform .15s}
+.star-picker span:hover{transform:scale(1.2)}
+
+/* ── MODAL DÉTAIL ── */
+#detailModal{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:850;display:none;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(4px)}
+#detailModal.open{display:flex}
+.detail-box{background:var(--white);border-radius:var(--r-xl);width:100%;max-width:480px;max-height:90vh;overflow-y:auto;box-shadow:var(--shadow-lg);animation:popIn .3s cubic-bezier(.34,1.56,.64,1)}
+@keyframes popIn{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:scale(1)}}
+.detail-img{width:100%;padding-top:56%;position:relative;border-radius:var(--r-xl) var(--r-xl) 0 0;overflow:hidden;background:var(--rose3)}
+.detail-img img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.detail-close-btn{position:absolute;top:12px;right:12px;background:rgba(0,0,0,.5);color:#fff;border:none;width:32px;height:32px;border-radius:50%;cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.detail-body{padding:20px}
+.detail-name{font-family:'Cormorant Garamond',serif;font-size:1.6rem;font-weight:700;color:var(--dark);margin-bottom:4px}
+.detail-desc{color:var(--mid);font-size:.84rem;line-height:1.5;margin-bottom:14px}
+.detail-meta{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.detail-pill{display:flex;align-items:center;gap:5px;background:var(--rose3);border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:.74rem;font-weight:600;color:var(--rose)}
+.detail-pill svg{width:13px;height:13px;fill:currentColor}
+
+/* ═══════════════════════════════════════
+   ÉTAPE 4 — HAIRSTYLES TV
+═══════════════════════════════════════ */
+#tvModal{position:fixed;inset:0;background:#000;z-index:3000;display:none;flex-direction:column}
+#tvModal.open{display:flex}
+.tv-main{flex:1;position:relative;overflow:hidden;background:#0a0608}
+.tv-video-wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+.tv-video{width:100%;height:100%;object-fit:contain;background:#000}
+.tv-bg-gallery{position:absolute;inset:0;z-index:0}
+.tv-bg-slide{position:absolute;inset:0;background-size:cover;background-position:center;opacity:0;transition:opacity 2s ease;filter:blur(2px) brightness(.4)}
+.tv-bg-slide.active{opacity:1}
+.tv-overlay-top{position:absolute;top:0;left:0;right:0;height:120px;background:linear-gradient(#000,transparent);z-index:2;pointer-events:none}
+.tv-overlay-bottom{position:absolute;bottom:0;left:0;right:0;height:180px;background:linear-gradient(transparent,rgba(0,0,0,.9));z-index:2;pointer-events:none}
+.tv-header{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;padding:20px 28px;z-index:5}
+.tv-logo{font-family:'Cormorant Garamond',serif;color:#fff;font-size:clamp(1.4rem,3vw,2rem);font-weight:700;letter-spacing:2px}
+.tv-logo em{color:var(--rose2)}
+.tv-clock{color:rgba(255,255,255,.7);font-size:clamp(.9rem,2vw,1.1rem);font-weight:600;letter-spacing:2px;font-feature-settings:'tnum'}
+.tv-close-btn{background:rgba(255,255,255,.1);border:1.5px solid rgba(255,255,255,.2);color:#fff;padding:8px 16px;border-radius:20px;cursor:pointer;font-size:.78rem;font-weight:700;transition:var(--t);backdrop-filter:blur(4px)}
+.tv-close-btn:hover{background:rgba(192,57,43,.4);border-color:rgba(192,57,43,.6)}
+.tv-media-info{position:absolute;bottom:100px;left:28px;right:28px;z-index:5}
+.tv-track-title{color:#fff;font-family:'Cormorant Garamond',serif;font-size:clamp(1.2rem,3vw,1.8rem);font-weight:700;margin-bottom:4px;text-shadow:0 2px 12px rgba(0,0,0,.5)}
+.tv-track-sub{color:rgba(255,255,255,.5);font-size:clamp(.72rem,1.5vw,.88rem)}
+.tv-progress-bar{width:100%;height:3px;background:rgba(255,255,255,.15);border-radius:3px;margin-top:10px;overflow:hidden}
+.tv-progress-fill{height:100%;background:linear-gradient(90deg,var(--rose),var(--rose2));border-radius:3px;width:0%;transition:width .5s linear}
+.tv-controls{position:absolute;bottom:24px;left:0;right:0;display:flex;align-items:center;justify-content:center;gap:14px;z-index:5}
+.tv-ctrl-btn{background:rgba(255,255,255,.1);border:1.5px solid rgba(255,255,255,.18);color:#fff;width:clamp(44px,6vw,56px);height:clamp(44px,6vw,56px);border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:var(--t);backdrop-filter:blur(4px)}
+.tv-ctrl-btn:hover{background:var(--rose);border-color:var(--rose);transform:scale(1.1)}
+.tv-ctrl-btn.play-pause{width:clamp(56px,7vw,70px);height:clamp(56px,7vw,70px)}
+.tv-ctrl-btn svg{width:clamp(18px,3vw,24px);height:clamp(18px,3vw,24px);fill:currentColor}
+.tv-volume{display:flex;align-items:center;gap:8px;position:absolute;bottom:32px;right:28px;z-index:5}
+.tv-volume svg{width:16px;height:16px;fill:rgba(255,255,255,.6)}
+.tv-vol-slider{-webkit-appearance:none;appearance:none;width:80px;height:3px;background:rgba(255,255,255,.2);border-radius:3px;outline:none;cursor:pointer}
+.tv-vol-slider::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--rose2);cursor:pointer}
+.tv-playlist-panel{width:280px;background:#0d0a0b;border-left:1px solid rgba(255,255,255,.07);overflow-y:auto;display:none;flex-direction:column}
+.tv-playlist-panel.show{display:flex}
+.tv-pl-header{padding:16px 14px 10px;font-size:.78rem;font-weight:700;color:rgba(255,255,255,.5);text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid rgba(255,255,255,.06)}
+.tv-pl-item{display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;transition:var(--t);border-bottom:1px solid rgba(255,255,255,.04)}
+.tv-pl-item:hover{background:rgba(255,255,255,.04)}
+.tv-pl-item.active{background:rgba(184,124,116,.12);border-left:2.5px solid var(--rose)}
+.tv-pl-num{color:rgba(255,255,255,.25);font-size:.7rem;font-weight:700;width:20px;text-align:right;flex-shrink:0}
+.tv-pl-info{flex:1;min-width:0}
+.tv-pl-title{color:#fff;font-size:.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tv-pl-url{color:rgba(255,255,255,.25);font-size:.62rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.tv-pl-del{background:none;border:none;color:rgba(255,0,0,.4);font-size:.9rem;cursor:pointer;padding:2px 4px;border-radius:4px;transition:var(--t)}
+.tv-pl-del:hover{color:#e57373;background:rgba(192,57,43,.15)}
+.tv-ticker{position:absolute;bottom:0;left:0;right:0;height:34px;background:rgba(0,0,0,.6);border-top:1px solid rgba(255,255,255,.06);display:flex;align-items:center;overflow:hidden;z-index:4}
+.tv-ticker-content{white-space:nowrap;font-size:.74rem;color:rgba(255,255,255,.75);animation:tickerScroll 25s linear infinite;padding-left:100%;font-weight:500}
+.tv-qr{position:absolute;bottom:80px;right:28px;z-index:5;background:rgba(255,255,255,.95);border-radius:12px;padding:8px;width:80px;height:80px;display:none}
+.tv-qr.show{display:block}
+.tv-qr canvas{width:64px!important;height:64px!important}
+.tv-screensaver{position:absolute;inset:0;z-index:6;background:#000;opacity:0;transition:opacity 1s;pointer-events:none}
+.tv-screensaver.show{opacity:1;pointer-events:auto}
+
+/* ── MODAL PIN ── */
+#pinModal{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:1100;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
+#pinModal.open{display:flex}
+.pin-box{background:var(--dark2);border:1px solid rgba(255,255,255,.1);border-radius:var(--r-xl);padding:32px 28px;text-align:center;max-width:320px;width:90%}
+.pin-box h3{font-family:'Cormorant Garamond',serif;color:#fff;font-size:1.5rem;font-weight:700;margin-bottom:6px}
+.pin-box p{color:rgba(255,255,255,.4);font-size:.78rem;margin-bottom:20px}
+#pinInput{width:100%;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.15);border-radius:var(--r-sm);padding:12px;color:#fff;font-size:1.2rem;text-align:center;letter-spacing:8px;outline:none}
+#pinInput:focus{border-color:var(--rose2)}
+.pin-btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.btn-pin{padding:10px;border-radius:var(--r-sm);font-size:.82rem;font-weight:700;cursor:pointer;border:none;transition:var(--t)}
+.btn-pin-ok{background:var(--rose);color:#fff}.btn-pin-ok:hover{background:var(--rose2)}
+.btn-pin-cancel{background:rgba(255,255,255,.08);color:rgba(255,255,255,.7)}.btn-pin-cancel:hover{background:rgba(255,255,255,.15)}
+
+/* ══════════════════════════════════════
+   PANEL ADMIN — v3
+══════════════════════════════════════ */
+#adminModal{position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:1000;display:none;flex-direction:column;backdrop-filter:blur(10px)}
+#adminModal.open{display:flex}
+.admin-head{background:linear-gradient(135deg,var(--dark2),#2C1B1C);color:#fff;padding:16px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.08)}
+.admin-head h2{font-family:'Cormorant Garamond',serif;font-size:1.4rem;font-weight:700;display:flex;align-items:center;gap:8px}
+.admin-head h2 svg{width:20px;height:20px;fill:var(--rose2)}
+.admin-tabs{display:flex;gap:0;background:rgba(255,255,255,.05);border-bottom:1px solid rgba(255,255,255,.08);flex-shrink:0;overflow-x:auto;scrollbar-width:none}
+.admin-tabs::-webkit-scrollbar{display:none}
+.admin-tab{flex-shrink:0;padding:12px 14px;border:none;background:none;color:rgba(255,255,255,.5);font-size:.72rem;font-weight:600;cursor:pointer;transition:var(--t);border-bottom:2px solid transparent;text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}
+.admin-tab.active{color:#fff;border-bottom-color:var(--rose2)}
+.admin-body{flex:1;overflow-y:auto;padding:20px}
+.admin-section{display:none}.admin-section.active{display:block}
+.admin-form{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:var(--r);padding:16px;margin-bottom:16px}
+.admin-form h4{color:#fff;font-size:.82rem;font-weight:700;text-transform:uppercase;letter-spacing:.4px;margin-bottom:12px;display:flex;align-items:center;gap:7px}
+.admin-form p.hint{color:rgba(255,255,255,.35);font-size:.72rem;margin-bottom:12px;line-height:1.5}
+.admin-input{width:100%;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.12);border-radius:var(--r-sm);padding:9px 13px;color:#fff;font-size:.84rem;outline:none;transition:var(--t)}
+.admin-input:focus{border-color:var(--rose2);background:rgba(255,255,255,.1)}
+.admin-input::placeholder{color:rgba(255,255,255,.3)}
+.admin-row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.admin-row3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px}
+.admin-label{display:block;font-size:.68rem;font-weight:700;color:rgba(255,255,255,.45);text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
+.btn-admin-save{background:linear-gradient(135deg,var(--rose),var(--rose2));color:#fff;border:none;border-radius:var(--r-sm);padding:9px 18px;font-size:.8rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;transition:var(--t)}
+.btn-admin-save:hover{opacity:.88}
+.btn-admin-del{background:rgba(192,57,43,.15);border:1.5px solid rgba(192,57,43,.3);color:#e57373;border-radius:var(--r-sm);padding:9px 14px;font-size:.8rem;font-weight:700;cursor:pointer;transition:var(--t)}
+.btn-admin-del:hover{background:rgba(192,57,43,.3)}
+.admin-toggle-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.admin-toggle-row:last-child{border-bottom:none}
+.admin-toggle-label{color:#fff;font-size:.82rem;font-weight:600}
+.admin-toggle-sub{color:rgba(255,255,255,.35);font-size:.7rem;margin-top:2px}
+.toggle-switch{position:relative;width:44px;height:24px;flex-shrink:0}
+.toggle-switch input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;inset:0;background:rgba(255,255,255,.15);border-radius:24px;cursor:pointer;transition:.3s}
+.toggle-slider::before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+.toggle-switch input:checked + .toggle-slider{background:var(--rose)}
+.toggle-switch input:checked + .toggle-slider::before{transform:translateX(20px)}
+.resa-card{background:rgba(255,255,255,.04);border:1.5px solid rgba(255,255,255,.08);border-radius:var(--r);padding:14px;margin-bottom:10px}
+.resa-card.new{border-color:rgba(184,124,116,.5);box-shadow:0 0 0 2px rgba(184,124,116,.15)}
+.resa-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:8px}
+.resa-card-name{font-weight:700;color:#fff;font-size:.9rem}
+.resa-card-time{font-size:.68rem;color:rgba(255,255,255,.4)}
+.resa-card-coif{font-size:.78rem;color:rgba(255,255,255,.65);margin-bottom:6px}
+.resa-card-detail{font-size:.72rem;color:rgba(255,255,255,.4)}
+.statut-btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;border-top:1px solid rgba(255,255,255,.06);padding-top:10px}
+.s-btn{padding:5px 12px;border-radius:20px;font-size:.68rem;font-weight:700;cursor:pointer;border:1.5px solid;transition:var(--t)}
+.s-btn.attente{border-color:rgba(230,126,34,.4);color:#f39c12;background:rgba(230,126,34,.1)}
+.s-btn.cours{border-color:rgba(41,182,246,.4);color:#29b6f6;background:rgba(41,182,246,.1)}
+.s-btn.termine{border-color:rgba(39,174,96,.4);color:#27ae60;background:rgba(39,174,96,.1)}
+.s-btn:hover{opacity:.8}
+.statut-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.statut-badge.en_attente{background:rgba(230,126,34,.15);color:#f39c12;border:1px solid rgba(230,126,34,.3)}
+.statut-badge.en_cours{background:rgba(41,182,246,.15);color:#29b6f6;border:1px solid rgba(41,182,246,.3)}
+.statut-badge.termine{background:rgba(39,174,96,.15);color:#27ae60;border:1px solid rgba(39,174,96,.3)}
+
+/* ── DASHBOARD STATS (Étape 5) ── */
+.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
+.stat-card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:var(--r);padding:14px;text-align:center}
+.stat-val{font-family:'Cormorant Garamond',serif;font-size:2rem;font-weight:700;color:#fff;line-height:1}
+.stat-label{font-size:.65rem;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.5px;margin-top:4px}
+.stat-icon{font-size:1.2rem;margin-bottom:4px}
+.top-list-item{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.top-list-item:last-child{border-bottom:none}
+.top-list-name{font-size:.78rem;color:rgba(255,255,255,.8)}
+.top-list-count{font-size:.72rem;font-weight:700;color:var(--rose2);background:rgba(184,124,116,.12);padding:2px 8px;border-radius:12px}
+
+/* ── MODAL FILE D'ATTENTE (admin) ── */
+.queue-admin-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.08);border-radius:10px;margin-bottom:8px;background:rgba(255,255,255,.03)}
+.queue-admin-name{color:#fff;font-size:.84rem;font-weight:700}
+.queue-admin-detail{color:rgba(255,255,255,.4);font-size:.7rem}
+.queue-admin-btns{display:flex;gap:6px;margin-left:auto}
+
+/* ── TOAST ── */
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--dark2);color:#fff;padding:11px 22px;border-radius:40px;font-size:.82rem;z-index:9999;transition:.32s cubic-bezier(.4,0,.2,1);opacity:0;white-space:nowrap;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,.25);font-weight:600;max-width:88vw}
+#toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+#toast.green{background:linear-gradient(135deg,var(--green),#219a52)}
+#toast.rose{background:linear-gradient(135deg,var(--rose),var(--rose2))}
+#toast.red{background:linear-gradient(135deg,var(--red),#e74c3c)}
+#toast.purple{background:linear-gradient(135deg,var(--purple),#5b21b6)}
+
+/* ── SCROLL TOP ── */
+#scrollTop{position:fixed;bottom:24px;right:16px;width:42px;height:42px;background:var(--rose);color:#fff;border:none;border-radius:50%;cursor:pointer;opacity:0;transition:var(--t);z-index:300;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 14px rgba(184,124,116,.4)}
+#scrollTop.show{opacity:1}
+#scrollTop svg{width:18px;height:18px;fill:currentColor}
+
+/* ── QR Code flottant TV ── */
+#tvQrFloat{position:fixed;bottom:90px;right:16px;z-index:290;display:none;flex-direction:column;align-items:center;gap:4px}
+#tvQrFloat.show{display:flex}
+#tvQrFloat canvas{width:64px!important;height:64px!important;border-radius:8px}
+#tvQrFloat span{font-size:.55rem;color:var(--muted);font-weight:600;text-align:center}
+
+/* ── NO RESULT ── */
+.no-result{grid-column:1/-1;text-align:center;padding:48px 20px;color:var(--muted)}
+.no-result svg{width:48px;height:48px;fill:var(--border);margin:0 auto 12px;display:block}
+
+/* ── FOOTER ── */
+footer{text-align:center;padding:20px;font-size:.68rem;color:var(--muted);border-top:1px solid var(--border)}
+
+/* ── RESPONSIVE ── */
+@media(max-width:380px){
+  #grid{grid-template-columns:1fr}
+  .form-row2{grid-template-columns:1fr}
+  .admin-row2,.admin-row3{grid-template-columns:1fr}
+  .stat-grid{grid-template-columns:1fr}
+}
+@media(max-width:540px){.tv-playlist-panel{display:none!important}}
+
+/* ── MODE TV fullscreen tweaks ── */
+@media(min-width:1200px){
+  .tv-logo{font-size:2.4rem}
+  .tv-track-title{font-size:2.2rem}
+  .tv-ctrl-btn{width:64px;height:64px}
+  .tv-ctrl-btn.play-pause{width:80px;height:80px}
+}
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════
+     ⚙️  CONFIGURATION DU SALON
+══════════════════════════════════════════════════════ -->
+<script>
+window.SALON_CONFIG = {
+  nom:       "BEAUTIFUL HAIRSTYLES",
+  slogan:    "L'art de la coiffure africaine",
+  ville:     "Ouagadougou · Burkina Faso",
+  whatsapp:  "22655700383",
+  maps:      "https://maps.google.com/?q=12.386600,-1.602619",
+  adresse:   "Secteur 38, Arrondissement 8°",
+  horaires:  "Lun–Sam : 8h–20h  ·  Dim : 9h–18h",
+  tiktok:    "https://www.tiktok.com/@beautifulhairstyle3",
+  facebook:  "https://www.facebook.com/votre_page",
+  logo:      "logo.png",
+  adminPin:  "1234",
+  promo:     "",
+
+  slides: [
+    "https://images.unsplash.com/photo-1522337360788-8b13dee7a37e?w=900&q=80",
+    "https://images.unsplash.com/photo-1562322140-8baeececf3df?w=900&q=80",
+    "https://images.unsplash.com/photo-1560066984-138daaa8eded?w=900&q=80",
+  ],
+
+  galerie: [
+    { img:"https://images.unsplash.com/photo-1590577976322-3d2d6a2130e5?w=500&q=75", label:"Box Braids", genre:"f", avant:"", apres:"https://images.unsplash.com/photo-1590577976322-3d2d6a2130e5?w=500&q=75" },
+    { img:"https://images.unsplash.com/photo-1614289371518-722f2615943d?w=500&q=75", label:"Cornrows", genre:"f" },
+    { img:"https://images.unsplash.com/photo-1605980776566-0486c3ac7617?w=500&q=75", label:"Locks", genre:"f" },
+    { img:"https://images.unsplash.com/photo-1562322140-8baeececf3df?w=500&q=75", label:"Coupe Homme", genre:"m" },
+    { img:"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=75", label:"Crochet Braids", genre:"f" },
+    { img:"https://images.unsplash.com/photo-1560066984-138daaa8eded?w=500&q=75", label:"Coloration", genre:"mf" },
+  ],
+
+  avis: [
+    { nom:"Aminata D.", note:5, texte:"Magnifique travail sur mes tresses ! Le salon est propre, l'équipe à l'écoute. Je reviendrai sûrement.", genre:"f" },
+    { nom:"Seydou K.", note:5, texte:"Excellent dégradé, le coiffeur connaît son métier. Ambiance top.", genre:"m" },
+    { nom:"Fatou T.", note:4, texte:"Très beau tissage, bien posé. Le salon est accueillant.", genre:"f" },
+  ],
+
+  firebase: {
+    apiKey: "AIzaSyALuXs5scz3O1uzC7PJ6Z-RY608ilFBMrg",
+    authDomain: "posv5-78b92.firebaseapp.com",
+    databaseURL: "https://posv5-78b92-default-rtdb.europe-west1.firebasedatabase.app",
+    projectId: "posv5-78b92",
+    storageBucket: "posv5-78b92.firebasestorage.app",
+    messagingSenderId: "508434695902",
+    appId: "1:508434695902:web:a3861784fb24a10c06244f"
+  }
+};
+
+window.COIFFEURS_DEFAULT = [
+  { id:'e1', nom:'Mariam', specialite:'Tresses · Locks · Tissage', genre:'f', dispo:true, emoji:'👩' },
+  { id:'e2', nom:'Kofi',   specialite:'Coupe · Dégradé · Barbe',  genre:'m', dispo:true, emoji:'👨' },
+  { id:'e3', nom:'Aïda',   specialite:'Coloration · Soins',        genre:'f', dispo:true, emoji:'👩' },
+  { id:'e4', nom:'Idriss', specialite:'Locks · Coupe · Tresses',   genre:'mf',dispo:true, emoji:'🧑' },
+];
+
+window.COIFFURES_DEFAULT = [
+  { id:'c1', cat:'tresses', genre:'f', nom:'Box Braids', desc:'Tresses carrées classiques, légères et durables.', prixBase:8000, prixMeches:12000, duree:'3–5h', img:'https://images.unsplash.com/photo-1590577976322-3d2d6a2130e5?w=400&q=75', dispo:true, badge:'Populaire' },
+  { id:'c2', cat:'tresses', genre:'f', nom:'Tresses Cornrows', desc:'Tresses plates collées au crâne avec motifs variés.', prixBase:5000, prixMeches:8000, duree:'2–3h', img:'https://images.unsplash.com/photo-1614289371518-722f2615943d?w=400&q=75', dispo:true },
+  { id:'c3', cat:'locks',   genre:'f', nom:'Locks Sénégalaises', desc:'Locks torsadées élégantes pour un look naturel.', prixBase:10000, prixMeches:15000, duree:'4–6h', img:'https://images.unsplash.com/photo-1605980776566-0486c3ac7617?w=400&q=75', dispo:true, badge:'Nouveau' },
+  { id:'c4', cat:'tissage', genre:'f', nom:'Tissage Naturel', desc:'Pose de tissage sur tresses plates. Volume au choix.', prixBase:12000, prixMeches:20000, duree:'3–5h', img:'https://images.unsplash.com/photo-1522337360788-8b13dee7a37e?w=400&q=75', dispo:true },
+  { id:'c5', cat:'tissage', genre:'f', nom:'Crochet Braids', desc:'Mèches crochetées sur cornrows. Résultat naturel rapide.', prixBase:9000, prixMeches:14000, duree:'2–4h', img:'https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=400&q=75', dispo:true },
+  { id:'c6', cat:'coloration', genre:'mf', nom:'Coloration Complète', desc:'Couleur racines et longueurs. Noir, châtain, blond, bordeaux…', prixBase:15000, prixMeches:null, duree:'2–3h', img:'https://images.unsplash.com/photo-1560066984-138daaa8eded?w=400&q=75', dispo:true },
+  { id:'c7', cat:'soins',   genre:'mf', nom:'Soin Hydratant', desc:'Masque nourrissant, lissage et brillance.', prixBase:6000, prixMeches:null, duree:'1–2h', img:'https://images.unsplash.com/photo-1616394584738-fc6e612e71b9?w=400&q=75', dispo:true },
+  { id:'c8', cat:'coupe',   genre:'f', nom:'Coupe & Brushing', desc:'Coupe personnalisée + brushing volume ou lissé.', prixBase:5000, prixMeches:null, duree:'1h', img:'https://images.unsplash.com/photo-1562322140-8baeececf3df?w=400&q=75', dispo:true },
+  { id:'c9',  cat:'coupe',  genre:'m', nom:'Coupe Homme', desc:'Coupe classique ou tendance selon morphologie.', prixBase:3000, prixMeches:null, duree:'45min', img:'https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=400&q=75', dispo:true, badge:'Rapide' },
+  { id:'c10', cat:'coupe',  genre:'m', nom:'Dégradé', desc:'Dégradé bas, mi-haut ou haut. Contour net inclus.', prixBase:3500, prixMeches:null, duree:'45min', img:'https://images.unsplash.com/photo-1519345182560-3f2917c472ef?w=400&q=75', dispo:true, badge:'Populaire' },
+  { id:'c11', cat:'barbe',  genre:'m', nom:'Taille de Barbe', desc:'Contour, dégradé barbe et finitions soignées.', prixBase:2500, prixMeches:null, duree:'30min', img:'https://images.unsplash.com/photo-1621605815971-fbc98d665033?w=400&q=75', dispo:true },
+  { id:'c12', cat:'barbe',  genre:'m', nom:'Rasage Traditionnel', desc:'Rasage à la lame chaude + serviette chaude. Pur luxe.', prixBase:4000, prixMeches:null, duree:'40min', img:'https://images.unsplash.com/photo-1517832207067-4db24a2ae47c?w=400&q=75', dispo:true, badge:'Premium' },
+  { id:'c13', cat:'locks',  genre:'m', nom:'Locks Homme', desc:'Pose ou entretien de locks naturels.', prixBase:8000, prixMeches:null, duree:'3–4h', img:'https://images.unsplash.com/photo-1534614971-6be99a7a3ffd?w=400&q=75', dispo:true },
+];
+
+window.COIFFEURS = window.COIFFEURS_DEFAULT ? [...window.COIFFEURS_DEFAULT] : [];
+
+window.CATEGORIES = [
+  { id:'toutes',    label:'Toutes',      emoji:'✨', genre:'all' },
+  { id:'tresses',   label:'Tresses',     emoji:'💫', genre:'f'   },
+  { id:'locks',     label:'Locks',       emoji:'🌿', genre:'mf'  },
+  { id:'tissage',   label:'Tissage',     emoji:'👑', genre:'f'   },
+  { id:'coloration',label:'Coloration',  emoji:'🎨', genre:'mf'  },
+  { id:'soins',     label:'Soins',       emoji:'💆', genre:'mf'  },
+  { id:'coupe',     label:'Coupe',       emoji:'✂️', genre:'mf'  },
+  { id:'barbe',     label:'Barbe',       emoji:'🪒', genre:'m'   },
+];
+</script>
+
+<!-- LOADER -->
+<div id="loader">
+  <div class="ld-logo" id="ldLogo">Salon <em>Belle</em></div>
+  <div class="ld-sub" id="ldSlogan">Chargement en cours…</div>
+  <div class="ld-bar"><div class="ld-fill"></div></div>
+  <div class="ld-dots"><div class="ld-dot"></div><div class="ld-dot"></div><div class="ld-dot"></div></div>
+</div>
+
+<!-- TOPBAR -->
+<div id="topbar">
+  <div class="t-brand" id="brandClick">
+    <div class="t-mark" id="brandMark">💇</div>
+    <div class="t-name" id="brandName">Salon <em>Belle</em></div>
+  </div>
+  <div class="t-actions">
+    <div class="fb-pill" title="État Firebase"><div class="fb-dot" id="fbDot"></div><span id="fbLabel">Local</span></div>
+    <button class="btn-i" onclick="toggleDark()" title="Mode sombre/clair">
+      <svg id="darkIco" viewBox="0 0 24 24"><path d="M12 3a9 9 0 100 18A9 9 0 0012 3zm0 2a7 7 0 010 14V5z"/></svg>
+    </button>
+    <button class="btn-i btn-wa" onclick="openWaSalon()" title="Contacter">
+      <svg viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884"/></svg>
+      Écrire
+    </button>
+  </div>
+</div>
+
+<!-- PROMO BANNIÈRE -->
+<div id="promoBanner"><span id="promoText"></span><button class="promo-close" onclick="document.getElementById('promoBanner').classList.remove('show')">✕</button></div>
+
+<!-- HERO -->
+<div id="hero">
+  <div class="hero-ss" id="heroSS"></div>
+  <div class="hero-c">
+    <h1 id="heroTitle">Salon <em>Belle</em></h1>
+    <p class="hero-sub" id="heroVille">Ouagadougou · Burkina Faso</p>
+    <div class="hero-div"></div>
+    <div class="hero-tags">
+      <span class="hero-tag">✂️ Femme</span>
+      <span class="hero-tag">🪒 Homme</span>
+      <span class="hero-tag">🌿 Locks</span>
+      <span class="hero-tag">🎨 Coloration</span>
+    </div>
+    <a id="heroMapBtn" class="hero-loc" href="#" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>
+      Nous localiser
+    </a>
+    <div class="hero-dots" id="heroDots"></div>
+  </div>
+</div>
+
+<!-- ÉTAPE 2 — TICKER BAR -->
+<div id="tickerBar">
+  <div class="ticker-label">📢 INFO</div>
+  <div class="ticker-track">
+    <div class="ticker-content" id="tickerContent">Bienvenue au salon !</div>
+  </div>
+</div>
+
+<!-- GENRE SWITCH -->
+<div id="genreBar">
+  <button class="genre-btn active-all" onclick="setGenre('all',this)">✨ Tous</button>
+  <div class="genre-sep"></div>
+  <button class="genre-btn" onclick="setGenre('f',this)">👩 Femme</button>
+  <div class="genre-sep"></div>
+  <button class="genre-btn" onclick="setGenre('m',this)">🧔 Homme</button>
+</div>
+
+<!-- TABS CATÉGORIES -->
+<div id="tabsWrap"><div id="tabs"></div></div>
+
+<!-- CATALOGUE -->
+<div id="catalogWrap">
+  <div class="search-wrap">
+    <div class="search-box">
+      <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <input type="text" id="searchInput" placeholder="Rechercher une coiffure…" oninput="filterCatalog()"/>
+    </div>
+  </div>
+  <div class="section-title" id="sectionTitle">Toutes les coiffures</div>
+  <div id="grid"></div>
+</div>
+
+<!-- ÉQUIPE -->
+<div id="equipe">
+  <div class="equipe-title">Notre Équipe</div>
+  <div class="equipe-sub">Choisissez votre coiffeur·se</div>
+  <div class="equipe-scroll" id="equipeGrid"></div>
+</div>
+
+<!-- GALERIE -->
+<div id="galerie">
+  <div class="gal-title">Galerie</div>
+  <div class="gal-sub">Avant · Après · Inspirations</div>
+  <div class="gal-controls">
+    <div class="gal-filter">
+      <button class="gal-f-btn active" onclick="setGalFilter('all',this)">✨ Tout</button>
+      <button class="gal-f-btn" onclick="setGalFilter('f',this)">👩 Femme</button>
+      <button class="gal-f-btn" onclick="setGalFilter('m',this)">🧔 Homme</button>
+      <button class="gal-f-btn" onclick="setGalFilter('mf',this)">🎨 Mixte</button>
+    </div>
+    <div class="gal-mode-btns">
+      <button class="gal-mode-btn" id="btnAutoPlay" onclick="toggleGalerieAutoPlay()" title="Défilement auto">
+        <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>Auto
+      </button>
+      <button class="gal-mode-btn" id="btnRemoteScroll" onclick="openGalerieSlideshow(0,true)" title="Mode présentation synchronisé">
+        <svg viewBox="0 0 24 24"><path d="M15 3H9c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h6c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-3 16c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm3-4H9V5h6v10z"/></svg>Sync
+      </button>
+    </div>
+  </div>
+  <div class="gal-grid" id="galGrid"></div>
+</div>
+
+<!-- ÉTAPE 3 — GALERIE SLIDESHOW PLEIN ÉCRAN -->
+<div id="galerieSlideshow">
+  <div class="gs-overlay"></div>
+  <div id="gsSlidesWrap"></div>
+  <div class="gs-remote-badge" id="gsRemoteBadge">📡 Mode Sync actif</div>
+  <div class="gs-counter" id="gsCounter">1 / 6</div>
+  <div class="gs-label" id="gsLabel"></div>
+  <button class="gs-btn gs-close" onclick="closeGalerieSlideshow()">
+    <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+  </button>
+  <div class="gs-dots" id="gsDots"></div>
+  <div class="gs-controls">
+    <button class="gs-btn" onclick="gsPrev()">
+      <svg viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+    </button>
+    <button class="gs-btn" id="gsPlayPauseBtn" onclick="toggleGsAutoPlay()">
+      <svg viewBox="0 0 24 24" id="gsPlayPauseIco"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+    </button>
+    <button class="gs-btn" onclick="gsNext()">
+      <svg viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+    </button>
+  </div>
+</div>
+
+<!-- AVANT/APRÈS MODAL -->
+<div id="avantApresModal">
+  <div class="aa-box">
+    <div class="aa-head"><span id="aaTitle">Avant / Après</span><button class="aa-close" onclick="closeAA()">✕</button></div>
+    <div class="aa-slider-wrap" id="aaSliderWrap">
+      <img id="aaApresImg" src="" alt="Après"/>
+      <div class="aa-overlay" id="aaOverlay" style="clip-path:inset(0 50% 0 0)">
+        <img id="aaAvantImg" src="" alt="Avant"/>
+      </div>
+      <div class="aa-divider" id="aaDivider" style="left:50%"></div>
+    </div>
+    <div class="aa-labels"><span>AVANT</span><span>APRÈS</span></div>
+  </div>
+</div>
+
+<!-- AVIS CLIENTS -->
+<div id="avis">
+  <div class="avis-title">Avis Clients</div>
+  <div class="avis-sub">Ce que disent nos clients</div>
+  <div class="avis-scroll" id="avisGrid"></div>
+  <button class="avis-add-btn" onclick="openAvisModal()">⭐ Laisser un avis</button>
+</div>
+
+<!-- ÉTAPE 5 — FILE D'ATTENTE -->
+<div id="queueSection">
+  <div class="queue-title">File d'attente</div>
+  <div class="queue-sub">Votre position en temps réel</div>
+  <div class="queue-board">
+    <div class="queue-header">
+      <div class="queue-header-title">
+        <svg viewBox="0 0 24 24" style="width:16px;height:16px;fill:currentColor"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+        En attente
+      </div>
+      <span class="queue-count-badge" id="queueCountBadge">0</span>
+    </div>
+    <div id="queueList"><div class="queue-empty">Aucun client en attente pour le moment.</div></div>
+  </div>
+  <button class="btn-join-queue" onclick="openJoinQueue()">
+    <svg viewBox="0 0 24 24" style="width:17px;height:17px;fill:currentColor"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+    Rejoindre la file d'attente
+  </button>
+</div>
+
+<!-- LOCALISATION -->
+<div id="localisation">
+  <div class="loc-title">Nous trouver</div>
+  <div class="loc-adresse" id="locAdresse">—</div>
+  <div class="loc-btns">
+    <a id="locMapsBtn" href="#" target="_blank" rel="noopener" class="btn-maps">
+      <svg viewBox="0 0 24 24"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>
+      Google Maps
+    </a>
+    <a id="locTiktokBtn" href="#" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,#010101,#2d2d2d);color:#fff;padding:10px 20px;border-radius:30px;font-size:.78rem;font-weight:700;text-decoration:none;transition:var(--t)">
+      <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor"><path d="M19.59 6.69a4.83 4.83 0 01-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 01-2.88 2.5 2.89 2.89 0 01-2.89-2.89 2.89 2.89 0 012.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 00-.79-.05 6.34 6.34 0 00-6.34 6.34 6.34 6.34 0 006.34 6.34 6.34 6.34 0 006.33-6.34V8.69a8.18 8.18 0 004.79 1.53V6.78a4.85 4.85 0 01-1.02-.09z"/></svg>
+      TikTok
+    </a>
+    <a id="locFacebookBtn" href="#" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,#1877F2,#0d5fd4);color:#fff;padding:10px 20px;border-radius:30px;font-size:.78rem;font-weight:700;text-decoration:none;transition:var(--t)">
+      <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
+      Facebook
+    </a>
+    <button class="btn-wa-loc" onclick="openWaSalon()">
+      <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884"/></svg>
+      WhatsApp
+    </button>
+  </div>
+  <div class="horaires">
+    <svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:var(--rose);display:inline;vertical-align:middle;margin-right:4px"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg>
+    <strong id="locHoraires">—</strong>
+  </div>
+</div>
+
+<footer>Conçu avec ❤️ · <span id="footerNom">Salon</span> · <a href="#" onclick="openAdmin()" style="color:var(--muted);text-decoration:none" title="Admin">⚙</a></footer>
+<button id="scrollTop" onclick="window.scrollTo({top:0,behavior:'smooth'})"><svg viewBox="0 0 24 24"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z"/></svg></button>
+<div id="toast"></div>
+<div id="tvQrFloat"><canvas id="tvQrCanvas"></canvas><span>Scanner pour<br>réserver</span></div>
+
+
+<!-- MODAL RÉSERVATION -->
+<div id="resaModal">
+  <div class="resa-sheet">
+    <div class="resa-head">
+      <h3><svg viewBox="0 0 24 24"><path d="M17 12h-5v5h5v-5zM16 1v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2h-1V1h-2zm3 18H5V8h14v11z"/></svg>Réserver</h3>
+      <button class="resa-close" onclick="closeResa()">✕</button>
+    </div>
+    <div class="resa-body">
+      <div class="resa-preview" id="resaPreview">
+        <img id="resaPreviewImg" src="" alt=""/>
+        <div class="resa-preview-info"><h4 id="resaPreviewNom">—</h4><p id="resaPreviewDuree">—</p></div>
+        <div class="resa-preview-price" id="resaPreviewPrix">—</div>
+      </div>
+      <div id="resaOptWrap" style="margin-bottom:14px">
+        <div class="resa-opt-label">Options</div>
+        <div class="resa-opts" id="resaOpts"></div>
+      </div>
+      <div style="margin-bottom:14px">
+        <div class="resa-opt-label">Choisir un·e coiffeur·se</div>
+        <div class="resa-coiffeurs" id="resaCoiffeurs"></div>
+      </div>
+      <div class="form-group"><label>Votre nom</label><input class="form-control" id="resaNom" type="text" placeholder="Prénom et nom"/></div>
+      <div class="form-row2">
+        <div class="form-group"><label>Date souhaitée</label><input class="form-control" id="resaDate" type="date"/></div>
+        <div class="form-group"><label>Heure</label><input class="form-control" id="resaHeure" type="time" value="09:00"/></div>
+      </div>
+      <div class="form-group"><label>Message (optionnel)</label><textarea class="form-control" id="resaNote" rows="2" placeholder="Précisions, questions…"></textarea></div>
+      <button class="btn-send-wa" onclick="sendResaWA()">
+        <svg viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884"/></svg>
+        Envoyer sur WhatsApp
+      </button>
+      <button class="btn-send-wa-sec" onclick="saveResaFirebase()">💾 Enregistrer sans WA</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL DÉTAIL -->
+<div id="detailModal">
+  <div class="detail-box">
+    <div class="detail-img"><img id="detailImg" src="" alt=""/><button class="detail-close-btn" onclick="closeDetail()">✕</button></div>
+    <div class="detail-body">
+      <div class="detail-name" id="detailNom">—</div>
+      <div class="detail-desc" id="detailDesc">—</div>
+      <div class="detail-meta" id="detailMeta"></div>
+      <div class="resa-opts" id="detailOpts" style="margin-bottom:14px"></div>
+      <button class="btn-send-wa" onclick="openResaFromDetail()">
+        <svg viewBox="0 0 24 24"><path d="M17 12h-5v5h5v-5zM16 1v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2h-1V1h-2zm3 18H5V8h14v11z"/></svg>
+        Réserver cette coiffure
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL AVIS -->
+<div id="avisModal">
+  <div class="avis-box">
+    <h3>⭐ Laisser un avis</h3>
+    <div class="form-group"><label>Votre nom</label><input class="form-control" id="avisNom" type="text" placeholder="Prénom"/></div>
+    <div class="form-group">
+      <label>Note</label>
+      <div class="star-picker" id="starPicker">
+        <span onclick="setNote(1)">⭐</span><span onclick="setNote(2)">⭐</span>
+        <span onclick="setNote(3)">⭐</span><span onclick="setNote(4)">⭐</span><span onclick="setNote(5)">⭐</span>
+      </div>
+    </div>
+    <div class="form-group"><label>Votre avis</label><textarea class="form-control" id="avisTexte" rows="3" placeholder="Partagez votre expérience…"></textarea></div>
+    <div style="display:flex;gap:8px;margin-top:4px">
+      <button class="btn-send-wa" style="margin-top:0" onclick="submitAvis()">Publier via WhatsApp</button>
+      <button onclick="closeAvisModal()" style="padding:12px 16px;border-radius:var(--r);background:var(--lite);border:1.5px solid var(--border);color:var(--mid);font-weight:700;cursor:pointer;font-size:.84rem">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL PIN ADMIN -->
+<div id="pinModal">
+  <div class="pin-box">
+    <h3>🔐 Administration</h3>
+    <p>Entrez votre code PIN pour accéder</p>
+    <input type="password" id="pinInput" maxlength="6" placeholder="••••" inputmode="numeric" onkeydown="if(event.key==='Enter')checkPin()"/>
+    <div class="pin-btns">
+      <button class="btn-pin btn-pin-ok" onclick="checkPin()">Entrer</button>
+      <button class="btn-pin btn-pin-cancel" onclick="closePin()">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL FILE D'ATTENTE (rejoindre) -->
+<div id="joinQueueModal" style="position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:950;display:none;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(4px)">
+  <div style="background:var(--white);border-radius:var(--r-xl);width:100%;max-width:400px;padding:28px;box-shadow:var(--shadow-lg)">
+    <h3 style="font-family:'Cormorant Garamond',serif;font-size:1.4rem;font-weight:700;color:var(--dark);margin-bottom:16px">🕐 Rejoindre la file</h3>
+    <div class="form-group"><label>Votre nom</label><input class="form-control" id="queueNom" type="text" placeholder="Prénom et nom"/></div>
+    <div class="form-group"><label>Prestation souhaitée</label><input class="form-control" id="queueService" type="text" placeholder="Ex: Box Braids, Coupe…"/></div>
+    <div style="display:flex;gap:8px;margin-top:4px">
+      <button class="btn-send-wa" style="margin-top:0" onclick="submitJoinQueue()">✅ Rejoindre</button>
+      <button onclick="document.getElementById('joinQueueModal').style.display='none'" style="padding:12px 16px;border-radius:var(--r);background:var(--lite);border:1.5px solid var(--border);color:var(--mid);font-weight:700;cursor:pointer;font-size:.84rem">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════
+     MODAL ADMIN — v3 (tous les onglets)
+═══════════════════════════════════════ -->
+<div id="adminModal">
+  <div class="admin-head">
+    <h2><svg viewBox="0 0 24 24"><path d="M12 15.5A3.5 3.5 0 018.5 12 3.5 3.5 0 0112 8.5a3.5 3.5 0 013.5 3.5 3.5 3.5 0 01-3.5 3.5m7.43-2.92c.04-.34.07-.69.07-1.08s-.03-.73-.07-1.08l2.31-1.81c.21-.16.27-.44.14-.67l-2.19-3.79c-.14-.23-.41-.3-.64-.21l-2.72 1.09c-.57-.43-1.17-.79-1.83-1.07L14.02 3.1A.517.517 0 0013.5 2.7h-3c-.25 0-.46.18-.5.42L9.66 5.44c-.66.28-1.26.64-1.83 1.07L5.11 5.42c-.24-.09-.5-.01-.64.21L2.28 9.42c-.13.23-.07.51.14.67l2.31 1.81c-.04.35-.07.7-.07 1.08s.03.73.07 1.08L2.42 15.87c-.21.16-.27.44-.14.67l2.19 3.79c.14.23.41.3.64.21l2.72-1.09c.57.43 1.17.79 1.83 1.07l.34 2.33c.04.25.25.43.5.43h3c.25 0 .46-.18.5-.42l.34-2.34c.66-.28 1.26-.64 1.83-1.07l2.72 1.09c.24.09.5.01.64-.21l2.19-3.79c.14-.23.07-.51-.14-.67l-2.31-1.8z"/></svg>Administration</h2>
+    <button class="btn-i" style="color:#fff;background:rgba(192,57,43,.15);border-color:rgba(192,57,43,.3)" onclick="closeAdmin()">✕</button>
+  </div>
+  <div class="admin-tabs">
+    <button class="admin-tab active" onclick="switchAdminTab('dashboard',this)">📊 Dashboard</button>
+    <button class="admin-tab" onclick="switchAdminTab('reservations',this)">📅 Réservations</button>
+    <button class="admin-tab" onclick="switchAdminTab('catalogue',this)">💇 Catalogue</button>
+    <button class="admin-tab" onclick="switchAdminTab('equipe',this)">👥 Équipe</button>
+    <button class="admin-tab" onclick="switchAdminTab('galerie',this)">🖼️ Galerie</button>
+    <button class="admin-tab" onclick="switchAdminTab('slides',this)">🎞️ Hero</button>
+    <button class="admin-tab" onclick="switchAdminTab('ticker',this)">📢 Ticker</button>
+    <button class="admin-tab" onclick="switchAdminTab('tv',this)">📺 Hairstyles TV</button>
+    <button class="admin-tab" onclick="switchAdminTab('queue',this)">🕐 File d'attente</button>
+    <button class="admin-tab" onclick="switchAdminTab('notifs',this)">🔔 Notifs WA</button>
+  </div>
+  <div class="admin-body">
+
+    <!-- TAB DASHBOARD -->
+    <div class="admin-section active" id="tab-dashboard">
+      <div class="stat-grid" id="dashStats">
+        <div class="stat-card"><div class="stat-icon">📅</div><div class="stat-val" id="dTotal">—</div><div class="stat-label">Total réservations</div></div>
+        <div class="stat-card"><div class="stat-icon">☀️</div><div class="stat-val" id="dToday">—</div><div class="stat-label">Aujourd'hui</div></div>
+        <div class="stat-card"><div class="stat-icon">⏳</div><div class="stat-val" id="dAttente">—</div><div class="stat-label">En attente</div></div>
+        <div class="stat-card"><div class="stat-icon">👥</div><div class="stat-val" id="dQueue">—</div><div class="stat-label">File d'attente</div></div>
+      </div>
+      <div class="admin-form">
+        <h4>🏆 Coiffeurs les plus demandés</h4>
+        <div id="dashTopCoiffeurs"><p style="color:rgba(255,255,255,.3);font-size:.8rem">Chargement…</p></div>
+      </div>
+      <div class="admin-form">
+        <h4>✂️ Prestations populaires</h4>
+        <div id="dashTopPrestations"><p style="color:rgba(255,255,255,.3);font-size:.8rem">Chargement…</p></div>
+      </div>
+      <div class="admin-form">
+        <h4>⚙️ Accès rapide</h4>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn-admin-save" onclick="openTV()">📺 Lancer la TV</button>
+          <button class="btn-admin-save" onclick="switchAdminTab('ticker',document.querySelector('[onclick*=ticker]'))">📢 Modifier ticker</button>
+          <button class="btn-admin-save" onclick="switchAdminTab('galerie',document.querySelector('[onclick*=galerie]'))">🖼️ Galerie</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB RÉSERVATIONS -->
+    <div class="admin-section" id="tab-reservations">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+        <button onclick="setResaFilter('toutes',this)" class="filter-btn active-filter" style="padding:6px 14px;border-radius:20px;font-size:.72rem;font-weight:600;border:1.5px solid rgba(255,255,255,.25);background:rgba(255,255,255,.15);color:#fff;cursor:pointer">Toutes</button>
+        <button onclick="setResaFilter('en_attente',this)" class="filter-btn" style="padding:6px 14px;border-radius:20px;font-size:.72rem;font-weight:600;border:1.5px solid rgba(243,156,18,.35);background:rgba(243,156,18,.1);color:#f39c12;cursor:pointer">En attente</button>
+        <button onclick="setResaFilter('en_cours',this)" class="filter-btn" style="padding:6px 14px;border-radius:20px;font-size:.72rem;font-weight:600;border:1.5px solid rgba(41,182,246,.35);background:rgba(41,182,246,.1);color:#29b6f6;cursor:pointer">En cours</button>
+        <button onclick="setResaFilter('termine',this)" class="filter-btn" style="padding:6px 14px;border-radius:20px;font-size:.72rem;font-weight:600;border:1.5px solid rgba(39,174,96,.35);background:rgba(39,174,96,.1);color:#27ae60;cursor:pointer">Terminées</button>
+      </div>
+      <div id="resaList"><p style="color:rgba(255,255,255,.3);font-size:.82rem;text-align:center;padding:40px">Aucune réservation pour le moment.</p></div>
+    </div>
+
+    <!-- TAB CATALOGUE -->
+    <div class="admin-section" id="tab-catalogue">
+      <div class="admin-form">
+        <h4>➕ Ajouter / Modifier une coiffure</h4>
+        <input type="hidden" id="editId"/>
+        <div class="admin-row3" style="margin-bottom:10px">
+          <div><label class="admin-label">Nom</label><input class="admin-input" id="editNom" placeholder="Box Braids"/></div>
+          <div><label class="admin-label">Catégorie</label>
+            <select class="admin-input" id="editCat">
+              <option value="tresses">Tresses</option><option value="locks">Locks</option>
+              <option value="tissage">Tissage</option><option value="coloration">Coloration</option>
+              <option value="soins">Soins</option><option value="coupe">Coupe</option><option value="barbe">Barbe</option>
+            </select>
+          </div>
+          <div><label class="admin-label">Genre</label>
+            <select class="admin-input" id="editGenre">
+              <option value="f">👩 Femme</option><option value="m">🧔 Homme</option><option value="mf">✨ Mixte</option>
+            </select>
+          </div>
+        </div>
+        <div class="admin-row3" style="margin-bottom:10px">
+          <div><label class="admin-label">Prix base (F CFA)</label><input class="admin-input" id="editPrixBase" type="number" placeholder="8000"/></div>
+          <div><label class="admin-label">Prix avec mèches</label><input class="admin-input" id="editPrixMeches" type="number" placeholder="12000"/></div>
+          <div><label class="admin-label">Durée</label><input class="admin-input" id="editDuree" placeholder="3–5h"/></div>
+        </div>
+        <div style="margin-bottom:10px"><label class="admin-label">Description</label><textarea class="admin-input" id="editDesc" rows="2" placeholder="Description courte…"></textarea></div>
+        <div style="margin-bottom:10px"><label class="admin-label">URL Image</label><input class="admin-input" id="editImg" type="url" placeholder="https://…"/></div>
+        <div style="margin-bottom:10px"><label class="admin-label">Badge (optionnel)</label><input class="admin-input" id="editBadge" placeholder="Populaire"/></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn-admin-save" onclick="saveCoiffure()">💾 Enregistrer</button>
+          <button class="btn-admin-del" onclick="clearEditForm()">Annuler</button>
+        </div>
+      </div>
+      <div id="adminCatList"></div>
+    </div>
+
+    <!-- TAB ÉQUIPE -->
+    <div class="admin-section" id="tab-equipe">
+      <div class="admin-form">
+        <h4>👥 Ajouter / Modifier un coiffeur</h4>
+        <input type="hidden" id="eqId"/>
+        <div class="admin-row2" style="margin-bottom:10px">
+          <div><label class="admin-label">Prénom</label><input class="admin-input" id="eqNom" placeholder="Mariam"/></div>
+          <div><label class="admin-label">Genre</label>
+            <select class="admin-input" id="eqGenre">
+              <option value="f">👩 Femme</option><option value="m">🧔 Homme</option><option value="mf">✨ Mixte</option>
+            </select>
+          </div>
+        </div>
+        <div style="margin-bottom:10px"><label class="admin-label">Spécialités</label><input class="admin-input" id="eqSpe" placeholder="Tresses · Locks · Tissage"/></div>
+        <div style="margin-bottom:10px"><label class="admin-label">Photo (URL optionnelle)</label><input class="admin-input" id="eqPhoto" type="url" placeholder="https://…"/></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn-admin-save" onclick="saveCoiffeur()">💾 Enregistrer</button>
+          <button onclick="clearEqForm()" style="background:rgba(255,255,255,.08);border:1.5px solid rgba(255,255,255,.12);color:rgba(255,255,255,.5);border-radius:var(--r-sm);padding:9px 14px;font-size:.8rem;font-weight:700;cursor:pointer">Annuler</button>
+        </div>
+      </div>
+      <div id="adminEqList"></div>
+    </div>
+
+    <!-- TAB GALERIE — ÉTAPE 1 & 3 -->
+    <div class="admin-section" id="tab-galerie">
+      <div class="admin-form">
+        <h4>🖼️ Ajouter une photo à la galerie</h4>
+        <p class="hint">Les photos sont sauvegardées dans Firestore et visibles sur tous les appareils.</p>
+        <div class="admin-row2" style="margin-bottom:10px">
+          <div><label class="admin-label">URL de l'image (Après)</label><input class="admin-input" id="galUrl" type="url" placeholder="https://…"/></div>
+          <div><label class="admin-label">URL Avant (optionnel)</label><input class="admin-input" id="galAvant" type="url" placeholder="https://…"/></div>
+        </div>
+        <div class="admin-row2" style="margin-bottom:10px">
+          <div><label class="admin-label">Légende</label><input class="admin-input" id="galLabel" placeholder="Box Braids…"/></div>
+          <div><label class="admin-label">Genre</label>
+            <select class="admin-input" id="galGenre">
+              <option value="f">👩 Femme</option><option value="m">🧔 Homme</option><option value="mf">✨ Mixte</option>
+            </select>
+          </div>
+        </div>
+        <div id="galPreviewWrap" style="display:none;margin-bottom:10px">
+          <label class="admin-label">Aperçu</label>
+          <img id="galPreviewImg" src="" alt="" style="max-height:120px;border-radius:10px;object-fit:cover;border:1px solid rgba(255,255,255,.15)"/>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn-admin-save" onclick="adminAddGalerie()">➕ Ajouter</button>
+          <button onclick="clearGalForm()" style="background:rgba(255,255,255,.08);border:1.5px solid rgba(255,255,255,.12);color:rgba(255,255,255,.5);border-radius:var(--r-sm);padding:9px 14px;font-size:.8rem;font-weight:700;cursor:pointer">Annuler</button>
+        </div>
+      </div>
+      <!-- Modes galerie -->
+      <div class="admin-form">
+        <h4>🎮 Modes de la galerie</h4>
+        <div class="admin-toggle-row">
+          <div><div class="admin-toggle-label">▶️ Défilement automatique</div><div class="admin-toggle-sub">Les photos défilent seules toutes les X secondes</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="toggleAutoPlay" onchange="adminToggleAutoPlay(this.checked)"/><span class="toggle-slider"></span></label>
+        </div>
+        <div id="autoPlaySpeedWrap" style="display:none;padding-top:10px">
+          <label class="admin-label">Vitesse (secondes par photo)</label>
+          <select class="admin-input" id="autoPlaySpeed" onchange="adminSetAutoPlaySpeed(this.value)" style="max-width:160px">
+            <option value="3000">3 secondes</option>
+            <option value="5000" selected>5 secondes</option>
+            <option value="8000">8 secondes</option>
+            <option value="12000">12 secondes</option>
+          </select>
+        </div>
+        <div class="admin-toggle-row" style="margin-top:10px">
+          <div><div class="admin-toggle-label">📡 Mode Scroll Synchronisé</div><div class="admin-toggle-sub">Vos swipes se reflètent sur tous les écrans connectés</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="toggleRemoteScroll" onchange="adminToggleRemoteScroll(this.checked)"/><span class="toggle-slider"></span></label>
+        </div>
+      </div>
+      <div id="adminGalList"></div>
+    </div>
+
+    <!-- TAB HERO SLIDESHOW — ÉTAPE 1 -->
+    <div class="admin-section" id="tab-slides">
+      <div class="admin-form">
+        <h4>🎞️ Ajouter une photo au slideshow hero</h4>
+        <p class="hint">Ces photos s'affichent en grand en haut du site (max 8). Sauvegardées dans Firestore.</p>
+        <div style="margin-bottom:10px"><label class="admin-label">URL de l'image</label><input class="admin-input" id="slideUrl" type="url" placeholder="https://…"/></div>
+        <div id="slidePreviewWrap" style="display:none;margin-bottom:10px">
+          <label class="admin-label">Aperçu</label>
+          <img id="slidePreviewImg" src="" alt="" style="max-height:130px;width:100%;border-radius:10px;object-fit:cover;border:1px solid rgba(255,255,255,.15)"/>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn-admin-save" onclick="adminAddSlide()">➕ Ajouter</button>
+          <button onclick="document.getElementById('slideUrl').value='';document.getElementById('slidePreviewWrap').style.display='none'" style="background:rgba(255,255,255,.08);border:1.5px solid rgba(255,255,255,.12);color:rgba(255,255,255,.5);border-radius:var(--r-sm);padding:9px 14px;font-size:.8rem;font-weight:700;cursor:pointer">Annuler</button>
+        </div>
+      </div>
+      <div id="adminSlideList"></div>
+    </div>
+
+    <!-- TAB TICKER — ÉTAPE 2 -->
+    <div class="admin-section" id="tab-ticker">
+      <div class="admin-form">
+        <h4>📢 Bande défilante</h4>
+        <p class="hint">Un bandeau qui défile en bas du hero avec vos annonces. Configuré ici, visible sur tous les appareils en temps réel.</p>
+        <div class="admin-toggle-row">
+          <div><div class="admin-toggle-label">Activer le ticker</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="tickerEnabled" onchange="adminSaveTicker()"/><span class="toggle-slider"></span></label>
+        </div>
+        <div style="margin-top:12px;margin-bottom:10px">
+          <label class="admin-label">Texte du ticker (séparez les messages par " · ")</label>
+          <textarea class="admin-input" id="tickerText" rows="3" placeholder="🎉 Promo -20% ce week-end ! · 📞 Réservez sur WhatsApp · ✂️ Ouvert Lun–Sam 8h–20h"></textarea>
+        </div>
+        <div class="admin-row2" style="margin-bottom:12px">
+          <div>
+            <label class="admin-label">Vitesse</label>
+            <select class="admin-input" id="tickerSpeed">
+              <option value="slow">Lente</option>
+              <option value="normal" selected>Normale</option>
+              <option value="fast">Rapide</option>
+            </select>
+          </div>
+          <div>
+            <label class="admin-label">Couleur fond</label>
+            <select class="admin-input" id="tickerColor">
+              <option value="dark">Sombre (défaut)</option>
+              <option value="rose">Rose</option>
+              <option value="gold">Or</option>
+              <option value="green">Vert</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn-admin-save" onclick="adminSaveTicker()" style="width:100%;justify-content:center">💾 Sauvegarder & Appliquer</button>
+      </div>
+      <div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:var(--r-sm);padding:12px;margin-top:4px">
+        <div style="font-size:.68rem;color:rgba(255,255,255,.4);margin-bottom:6px;text-transform:uppercase;letter-spacing:.4px">Aperçu live</div>
+        <div id="tickerPreviewLive" style="font-size:.8rem;color:rgba(255,255,255,.7);padding:8px;background:rgba(0,0,0,.3);border-radius:6px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">—</div>
+      </div>
+    </div>
+
+    <!-- TAB HAIRSTYLES TV — ÉTAPE 4 -->
+    <div class="admin-section" id="tab-tv">
+      <div class="admin-form">
+        <h4>📺 Hairstyles TV — Lecteur Médias</h4>
+        <p class="hint">Ajoutez des liens MP4 (vidéo) ou MP3 (audio avec fond galerie). Idéal pour TV Android 55 pouces.</p>
+        <div style="margin-bottom:10px">
+          <label class="admin-label">Titre de la piste</label>
+          <input class="admin-input" id="tvTrackTitle" placeholder="Ambiance Afrobeat, Clip coiffure…"/>
+        </div>
+        <div style="margin-bottom:10px">
+          <label class="admin-label">URL Media (MP4 vidéo ou MP3 audio)</label>
+          <input class="admin-input" id="tvTrackUrl" type="url" placeholder="https://exemple.com/video.mp4"/>
+        </div>
+        <div style="margin-bottom:12px">
+          <label class="admin-label">Type</label>
+          <select class="admin-input" id="tvTrackType" style="max-width:200px">
+            <option value="video">🎬 Vidéo MP4</option>
+            <option value="audio">🎵 Audio MP3 (fond galerie)</option>
+          </select>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn-admin-save" onclick="adminAddTVTrack()">➕ Ajouter à la playlist</button>
+          <button class="btn-admin-save" style="background:linear-gradient(135deg,#7C3AED,#5b21b6)" onclick="openTV()">📺 Lancer la TV</button>
+        </div>
+      </div>
+      <div class="admin-form">
+        <h4>⚙️ Options TV</h4>
+        <div class="admin-toggle-row">
+          <div><div class="admin-toggle-label">Afficher QR Code sur la TV</div><div class="admin-toggle-sub">QR code pour réserver depuis son téléphone</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="tvShowQr" checked/><span class="toggle-slider"></span></label>
+        </div>
+        <div class="admin-toggle-row">
+          <div><div class="admin-toggle-label">Afficher le ticker sur la TV</div><div class="admin-toggle-sub">Le même ticker que sur le site</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="tvShowTicker" checked/><span class="toggle-slider"></span></label>
+        </div>
+        <div class="admin-toggle-row">
+          <div><div class="admin-toggle-label">Screensaver après inactivité</div><div class="admin-toggle-sub">Passe en mode galerie plein écran après 5 min</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="tvScreensaver"/><span class="toggle-slider"></span></label>
+        </div>
+      </div>
+      <div id="adminTVList"><p style="color:rgba(255,255,255,.35);text-align:center;padding:28px;font-size:.8rem">Aucune piste. Ajoutez des médias ci-dessus.</p></div>
+    </div>
+
+    <!-- TAB FILE D'ATTENTE ADMIN — ÉTAPE 5 -->
+    <div class="admin-section" id="tab-queue">
+      <div class="admin-form">
+        <h4>🕐 Gestion de la file d'attente</h4>
+        <div class="admin-toggle-row">
+          <div><div class="admin-toggle-label">Activer la file d'attente</div><div class="admin-toggle-sub">Les clients peuvent rejoindre la file depuis l'app</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="queueEnabled" onchange="adminToggleQueue(this.checked)"/><span class="toggle-slider"></span></label>
+        </div>
+      </div>
+      <div id="adminQueueList"><p style="color:rgba(255,255,255,.35);text-align:center;padding:28px;font-size:.8rem">File vide.</p></div>
+    </div>
+
+    <!-- TAB NOTIFICATIONS WA -->
+    <div class="admin-section" id="tab-notifs">
+      <div class="admin-form">
+        <h4>🔔 Envoyer une notification WhatsApp</h4>
+        <p class="hint">Envoyez un message groupé à vos clients via WhatsApp.</p>
+        <div style="margin-bottom:10px">
+          <label class="admin-label">Destinataires</label>
+          <select class="admin-input" id="notifCible">
+            <option value="all">Tous les clients</option>
+            <option value="f">Clientes (Femme)</option>
+            <option value="m">Clients (Homme)</option>
+            <option value="attente">Réservations en attente</option>
+          </select>
+        </div>
+        <div style="margin-bottom:10px">
+          <label class="admin-label">Type de message</label>
+          <select class="admin-input" id="notifType" onchange="updateNotifTemplate()">
+            <option value="promo">🎉 Promotion</option>
+            <option value="rappel">⏰ Rappel RDV</option>
+            <option value="nouveau">✨ Nouvelle prestation</option>
+            <option value="ferme">🔒 Fermeture exceptionnelle</option>
+            <option value="libre">✏️ Message libre</option>
+          </select>
+        </div>
+        <div style="margin-bottom:10px">
+          <label class="admin-label">Message</label>
+          <textarea class="admin-input" id="notifMsg" rows="5" placeholder="Votre message…"></textarea>
+        </div>
+        <div style="margin-bottom:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:var(--r-sm);padding:12px">
+          <div style="font-size:.68rem;color:rgba(255,255,255,.4);margin-bottom:6px;text-transform:uppercase;letter-spacing:.4px">Aperçu</div>
+          <div id="notifPreview" style="font-size:.82rem;color:rgba(255,255,255,.7);white-space:pre-wrap;line-height:1.5"></div>
+        </div>
+        <button class="btn-admin-save" onclick="sendNotifWA()" style="width:100%;justify-content:center;padding:12px">
+          <svg viewBox="0 0 24 24" style="width:15px;height:15px;fill:currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884"/></svg>
+          Ouvrir WhatsApp et envoyer
+        </button>
+      </div>
+      <div id="notifHistory"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════
+     ÉTAPE 4 — HAIRSTYLES TV MODAL
+═══════════════════════════════════════ -->
+<div id="tvModal">
+  <div class="tv-main">
+    <!-- Fond galerie (pour mode audio) -->
+    <div class="tv-bg-gallery" id="tvBgGallery"></div>
+    <!-- Vidéo -->
+    <div class="tv-video-wrap" id="tvVideoWrap" style="display:none">
+      <video id="tvVideo" class="tv-video" autoplay playsinline></video>
+    </div>
+    <!-- Overlays -->
+    <div class="tv-overlay-top"></div>
+    <div class="tv-overlay-bottom"></div>
+    <!-- Header TV -->
+    <div class="tv-header">
+      <div class="tv-logo" id="tvLogo">Salon <em>Belle</em></div>
+      <div class="tv-clock" id="tvClock">00:00</div>
+      <button class="tv-close-btn" onclick="closeTV()">✕ Fermer</button>
+    </div>
+    <!-- Info piste -->
+    <div class="tv-media-info">
+      <div class="tv-track-title" id="tvTrackTitleDisp">Sélectionnez un média…</div>
+      <div class="tv-track-sub" id="tvTrackSub"></div>
+      <div class="tv-progress-bar"><div class="tv-progress-fill" id="tvProgressFill"></div></div>
+    </div>
+    <!-- Contrôles -->
+    <div class="tv-controls">
+      <button class="tv-ctrl-btn" onclick="tvPrev()" title="Précédent">
+        <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+      </button>
+      <button class="tv-ctrl-btn play-pause" id="tvPlayPauseBtn" onclick="tvTogglePlay()" title="Play/Pause">
+        <svg viewBox="0 0 24 24" id="tvPlayIco"><path d="M8 5v14l11-7z"/></svg>
+      </button>
+      <button class="tv-ctrl-btn" onclick="tvNext()" title="Suivant">
+        <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+      </button>
+      <button class="tv-ctrl-btn" onclick="tvTogglePlaylist()" title="Playlist">
+        <svg viewBox="0 0 24 24"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>
+      </button>
+      <button class="tv-ctrl-btn" onclick="tvToggleFullscreen()" title="Plein écran">
+        <svg viewBox="0 0 24 24"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+      </button>
+    </div>
+    <!-- Volume -->
+    <div class="tv-volume">
+      <svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>
+      <input type="range" class="tv-vol-slider" id="tvVolSlider" min="0" max="100" value="70" oninput="tvSetVolume(this.value)"/>
+    </div>
+    <!-- Audio element (pour mp3) -->
+    <audio id="tvAudio" style="display:none"></audio>
+    <!-- Ticker TV -->
+    <div class="tv-ticker" id="tvTickerBar" style="display:none">
+      <div class="tv-ticker-content" id="tvTickerContent"></div>
+    </div>
+    <!-- Screensaver -->
+    <div class="tv-screensaver" id="tvScreensaver"></div>
+  </div>
+  <!-- Playlist Panel -->
+  <div class="tv-playlist-panel" id="tvPlaylistPanel">
+    <div class="tv-pl-header">Playlist</div>
+    <div id="tvPlaylistItems"></div>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     JAVASCRIPT v3.0 — Toutes les étapes
+═══════════════════════════════════════ -->
+<script>
+/* ══════════════════════════════════════
+   STATE GLOBAL
+══════════════════════════════════════ */
+let currentCat='toutes', currentGenre='all', galFilter='all';
+let currentCoiffure=null, currentOptPrix='base', currentCoiffeurId=null;
+let allResas=[], resaFilter='toutes', resaUnsub=null, statsUnsub=null;
+let clickCount=0, clickTimer=null;
+let slideIndex=0, slideTimer=null;
+let isDark=false, avisNote=5;
+let gsItems=[], gsIndex=0, gsTimer=null, gsIsPlaying=false, gsRemoteMode=false;
+let tvPlaylist=[], tvIndex=0, tvIsPlaying=false, tvClockTimer=null;
+let tvBgSlideTimer=null, tvBgIndex=0;
+let tvInactivityTimer=null;
+let queueUnsub=null;
+window.__isAdmin=false;
+window.__tvPlaylist=[];
+const S=window.SALON_CONFIG||{};
+
+/* ══════════════════════════════════════
+   INIT
+══════════════════════════════════════ */
+document.addEventListener('DOMContentLoaded',()=>{
+  applyConfig();
+  buildHero();
+  buildTabs();
+  buildEquipe();
+  buildGalerie();
+  buildAvis();
+  renderCatalog();
+  buildLocalisation();
+  initScrollBehaviors();
+  initTripleClick();
+  initAdminPreviews();
+  updateNotifTemplate();
+  applyTicker(null);
+  const today=new Date().toISOString().split('T')[0];
+  document.getElementById('resaDate').min=today;
+  document.getElementById('resaDate').value=today;
+  if(S.promo){document.getElementById('promoText').textContent=S.promo;document.getElementById('promoBanner').classList.add('show');}
+  if(new URLSearchParams(location.search).get('mode')==='tv') setTimeout(()=>window.openTV(),1200);
+  setTimeout(()=>document.getElementById('loader').classList.add('hide'),1400);
+});
+
+function applyConfig(){
+  const nom=S.nom||'Salon';
+  document.getElementById('pageTitle').textContent=nom+' — Catalogue';
+  document.getElementById('ldLogo').innerHTML=nom;
+  document.getElementById('ldSlogan').textContent=S.slogan||'Catalogue Coiffures';
+  document.getElementById('brandName').innerHTML=nom;
+  document.getElementById('heroTitle').innerHTML=nom;
+  document.getElementById('heroVille').textContent=S.ville||'';
+  document.getElementById('heroMapBtn').href=S.maps||'#';
+  document.getElementById('footerNom').textContent=nom;
+  document.getElementById('tvLogo').innerHTML=nom;
+}
+
+/* ══════════════════════════════════════
+   HERO SLIDESHOW
+══════════════════════════════════════ */
+function buildHero(){
+  if(slideTimer){clearInterval(slideTimer);slideTimer=null;}
+  const slides=S.slides||[];
+  const ss=document.getElementById('heroSS'),dots=document.getElementById('heroDots');
+  ss.innerHTML='';dots.innerHTML='';
+  if(!slides.length){ss.style.background='linear-gradient(150deg,#1A0F10 0%,#3D2527 100%)';return;}
+  slides.forEach((src,i)=>{
+    const d=document.createElement('div');
+    d.className='hero-sl'+(i===0?' active':'');
+    d.style.backgroundImage=`url('${src}')`;
+    ss.appendChild(d);
+    const dot=document.createElement('button');
+    dot.className='hero-dot'+(i===0?' active':'');
+    dot.onclick=()=>goSlide(i);
+    dots.appendChild(dot);
+  });
+  if(slides.length>1) slideTimer=setInterval(()=>goSlide((slideIndex+1)%slides.length),5000);
+}
+window.buildHero=buildHero;
+
+function goSlide(n){
+  const sls=document.querySelectorAll('.hero-sl'),dts=document.querySelectorAll('.hero-dot');
+  sls.forEach(s=>s.classList.remove('active'));dts.forEach(d=>d.classList.remove('active'));
+  if(sls[n]) sls[n].classList.add('active');if(dts[n]) dts[n].classList.add('active');
+  slideIndex=n;
+}
+window.goSlide=goSlide;
+
+/* ══════════════════════════════════════
+   GENRE & TABS
+══════════════════════════════════════ */
+function buildTabs(){
+  const cats=(window.CATEGORIES||[]).filter(c=>{
+    if(currentGenre==='all') return true;
+    if(c.id==='toutes') return true;
+    return c.genre==='mf'||c.genre===currentGenre;
+  });
+  document.getElementById('tabs').innerHTML=cats.map(c=>`<button class="tab-btn${c.id==='toutes'?' active':''}" onclick="setTab('${c.id}',this)">${c.emoji} ${c.label}</button>`).join('');
+}
+window.setGenre=function(g,el){
+  currentGenre=g;currentCat='toutes';
+  document.querySelectorAll('.genre-btn').forEach(b=>b.className='genre-btn');
+  if(el){el.classList.add(g==='f'?'active-f':g==='m'?'active-m':'active-all');}
+  buildTabs();renderCatalog();
+  document.getElementById('sectionTitle').textContent=g==='f'?'👩 Prestations Femme':g==='m'?'🧔 Prestations Homme':'✨ Toutes les prestations';
+};
+window.setTab=function(id,el){
+  currentCat=id;
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  if(el) el.classList.add('active');
+  renderCatalog();
+};
+
+/* ══════════════════════════════════════
+   CATALOGUE
+══════════════════════════════════════ */
+function renderCatalog(){
+  const source=window.__fbCoiffures||window.COIFFURES_DEFAULT||[];
+  const q=(document.getElementById('searchInput')?.value||'').toLowerCase().trim();
+  const filtered=source.filter(c=>{
+    const catOk=currentCat==='toutes'||c.cat===currentCat;
+    const genreOk=currentGenre==='all'||c.genre===currentGenre||c.genre==='mf';
+    const qOk=!q||c.nom.toLowerCase().includes(q)||(c.desc||'').toLowerCase().includes(q);
+    return catOk&&genreOk&&qOk;
+  });
+  const grid=document.getElementById('grid');
+  if(!filtered.length){grid.innerHTML=`<div class="no-result"><svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>Aucune coiffure trouvée</div>`;return;}
+  grid.innerHTML=filtered.map(c=>renderCard(c)).join('');
+}
+window.renderCatalog=renderCatalog;
+window.filterCatalog=function(){renderCatalog();};
+window.selectOpt=function(el){el.closest('.card').querySelectorAll('.opt-pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');};
+
+function renderCard(c){
+  const hasMeches=c.prixMeches&&c.prixMeches>0;
+  const prixAff='À partir de '+Number(c.prixBase).toLocaleString('fr-FR')+' F';
+  const genreLabel=c.genre==='f'?'👩 Femme':c.genre==='m'?'🧔 Homme':'✨ Mixte';
+  return `<div class="card">
+    <div class="card-img-wrap">
+      <img src="${c.img||''}" alt="${c.nom}" onerror="this.src='https://placehold.co/300x200/F9EEEC/B87C74?text=Photo'" loading="lazy"/>
+      ${c.badge?`<div class="card-badge">${c.badge}</div>`:''}
+      <div class="card-genre ${c.genre||'mf'}">${genreLabel}</div>
+      ${!c.dispo?`<div class="card-indispo"><span>Non dispo</span></div>`:''}
+    </div>
+    <div class="card-body">
+      <div class="card-name">${c.nom}</div>
+      <div class="card-desc">${c.desc||''}</div>
+      ${hasMeches?`<div class="card-opts"><span class="opt-pill active" onclick="selectOpt(this)">Sans mèches</span><span class="opt-pill" onclick="selectOpt(this)">Avec mèches</span></div>`:''}
+      <div class="card-meta">
+        <div class="card-price">${prixAff}</div>
+        <div class="card-duree"><svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg>${c.duree||'—'}</div>
+      </div>
+      <div class="card-btns">
+        ${c.dispo?`<button class="btn-wa-card" onclick='openResa(${JSON.stringify(c)})'><svg viewBox="0 0 24 24"><path d="M17 12h-5v5h5v-5zM16 1v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2h-1V1h-2zm3 18H5V8h14v11z"/></svg>Réserver</button>`:`<button class="btn-wa-card" style="background:#9E9E9E;cursor:not-allowed" disabled>Indisponible</button>`}
+        <button class="btn-info-card" onclick='openDetail(${JSON.stringify(c)})'><svg viewBox="0 0 24 24"><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></button>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ══════════════════════════════════════
+   ÉQUIPE
+══════════════════════════════════════ */
+function buildEquipe(){
+  const coiffeurs=window.COIFFEURS||window.COIFFEURS_DEFAULT||[];
+  const g=document.getElementById('equipeGrid');
+  if(!coiffeurs.length){document.getElementById('equipe').style.display='none';return;}
+  g.innerHTML=coiffeurs.filter(e=>e.dispo!==false).map(e=>`
+    <div class="coiffeur-card" onclick="filterByCoiffeur('${e.id}',this)">
+      ${e.photo?`<img class="coiffeur-avatar" src="${e.photo}" alt="${e.nom}"/>`:`<div class="coiffeur-avatar-placeholder">${e.emoji||'💇'}</div>`}
+      <div class="coiffeur-name">${e.nom}</div>
+      <div class="coiffeur-spe">${e.specialite||''}</div>
+      <span class="coiffeur-badge ${e.genre||'mf'}">${e.genre==='f'?'Femme':e.genre==='m'?'Homme':'Mixte'}</span>
+    </div>`).join('');
+}
+window.filterByCoiffeur=function(id,el){
+  document.querySelectorAll('.coiffeur-card').forEach(c=>c.classList.remove('selected'));
+  if(el) el.classList.add('selected');
+};
+
+/* ══════════════════════════════════════
+   GALERIE
+══════════════════════════════════════ */
+function buildGalerie(){
+  const gal=S.galerie||[];
+  const section=document.getElementById('galerie');
+  if(!gal.length){section.style.display='none';return;}
+  section.style.display='block';
+  renderGalerie(gal);
+}
+window.buildGalerie=buildGalerie;
+
+function renderGalerie(items){
+  const g=document.getElementById('galGrid');
+  g.innerHTML=items.map((item,i)=>`
+    <div class="gal-item" onclick="openGalerieSlideshow(${i},false)">
+      <div class="gal-item-inner">
+        <img src="${item.img||''}" onerror="this.src='https://placehold.co/300x300/F9EEEC/B87C74?text=Photo'" loading="lazy" alt="${item.label||''}"/>
+        <div class="gal-label">${item.label||''} ${item.avant?'🔄':''}</div>
+        <div class="gal-genre-tag ${item.genre||'f'}">${item.genre==='m'?'Homme':item.genre==='mf'?'Mixte':'Femme'}</div>
+      </div>
+    </div>`).join('');
+}
+window.setGalFilter=function(f,el){
+  galFilter=f;
+  document.querySelectorAll('.gal-f-btn').forEach(b=>b.classList.remove('active'));
+  if(el) el.classList.add('active');
+  const gal=S.galerie||[];
+  renderGalerie(f==='all'?gal:gal.filter(item=>item.genre===f));
+};
+
+/* ── Galerie Slideshow plein écran ── */
+window.openGalerieSlideshow=function(startIndex,remoteMode){
+  const gal=galFilter==='all'?S.galerie||[]:(S.galerie||[]).filter(i=>i.genre===galFilter);
+  if(!gal.length) return;
+  gsItems=gal;gsIndex=startIndex||0;gsRemoteMode=!!remoteMode;
+  const wrap=document.getElementById('gsSlidesWrap');
+  wrap.innerHTML=gal.map((item,i)=>`<img class="gs-img${i===gsIndex?' active':''}" src="${item.img||''}" onerror="this.src='https://placehold.co/800x600/1A1618/B87C74?text=Photo'" alt="${item.label||''}"/>`).join('');
+  const dots=document.getElementById('gsDots');
+  dots.innerHTML=gal.map((_,i)=>`<button class="gs-dot${i===gsIndex?' active':''}" onclick="gsGoto(${i})"></button>`).join('');
+  updateGsUI();
+  document.getElementById('galerieSlideshow').classList.add('open');
+  document.body.style.overflow='hidden';
+  if(gsRemoteMode) document.getElementById('gsRemoteBadge').classList.add('show');
+  if(window.__galerieAutoPlay?.enabled) startGsAutoPlay();
+};
+window.closeGalerieSlideshow=function(){
+  stopGsAutoPlay();
+  document.getElementById('galerieSlideshow').classList.remove('open');
+  document.body.style.overflow='';
+  document.getElementById('gsRemoteBadge').classList.remove('show');
+};
+function updateGsUI(){
+  document.querySelectorAll('.gs-img').forEach((img,i)=>img.classList.toggle('active',i===gsIndex));
+  document.querySelectorAll('.gs-dot').forEach((d,i)=>d.classList.toggle('active',i===gsIndex));
+  document.getElementById('gsLabel').textContent=gsItems[gsIndex]?.label||'';
+  document.getElementById('gsCounter').textContent=(gsIndex+1)+' / '+gsItems.length;
+}
+window.gsGoto=function(n){
+  gsIndex=Math.max(0,Math.min(gsItems.length-1,n));
+  updateGsUI();
+  if(gsRemoteMode&&window.__isAdmin&&window.fbSendRemoteCmd) window.fbSendRemoteCmd({action:'gallery_goto',index:gsIndex});
+};
+window.gsNext=function(){window.gsGoto((gsIndex+1)%gsItems.length);};
+window.gsPrev=function(){window.gsGoto((gsIndex-1+gsItems.length)%gsItems.length);};
+window.toggleGsAutoPlay=function(){if(gsIsPlaying) stopGsAutoPlay(); else startGsAutoPlay();};
+function startGsAutoPlay(){
+  gsIsPlaying=true;
+  const interval=window.__galerieAutoPlay?.interval||5000;
+  if(gsTimer) clearInterval(gsTimer);
+  gsTimer=setInterval(()=>window.gsGoto((gsIndex+1)%gsItems.length),interval);
+  const ico=document.getElementById('gsPlayPauseIco');
+  if(ico) ico.innerHTML='<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
+}
+function stopGsAutoPlay(){
+  gsIsPlaying=false;
+  if(gsTimer){clearInterval(gsTimer);gsTimer=null;}
+  const ico=document.getElementById('gsPlayPauseIco');
+  if(ico) ico.innerHTML='<path d="M8 5v14l11-7z"/>';
+}
+window.galerieGotoRemote=function(index){
+  if(!document.getElementById('galerieSlideshow').classList.contains('open')){
+    window.openGalerieSlideshow(index,false);
+    document.getElementById('gsRemoteBadge').classList.add('show');
+    return;
+  }
+  gsIndex=Math.max(0,Math.min(gsItems.length-1,index));
+  updateGsUI();
+  showToast('📡 Mise à jour distante','purple');
+};
+window.toggleGalerieAutoPlay=function(){
+  const newState=!window.__galerieAutoPlay?.enabled;
+  window.__galerieAutoPlay={enabled:newState,interval:window.__galerieAutoPlay?.interval||5000};
+  if(window.fbSaveSettings) window.fbSaveSettings('galerieAutoPlay',window.__galerieAutoPlay);
+  document.getElementById('btnAutoPlay')?.classList.toggle('active',newState);
+  const tog=document.getElementById('toggleAutoPlay');
+  if(tog) tog.checked=newState;
+  const wrap=document.getElementById('autoPlaySpeedWrap');
+  if(wrap) wrap.style.display=newState?'block':'none';
+  showToast(newState?'▶️ Auto-play activé':'⏹ Auto-play désactivé','rose');
+};
+window.applyGalerieAutoPlay=function(){
+  const ap=window.__galerieAutoPlay;if(!ap) return;
+  const btn=document.getElementById('btnAutoPlay');if(btn) btn.classList.toggle('active',ap.enabled);
+  const tog=document.getElementById('toggleAutoPlay');if(tog) tog.checked=ap.enabled;
+};
+window.adminToggleAutoPlay=function(on){
+  window.__galerieAutoPlay={enabled:on,interval:parseInt(document.getElementById('autoPlaySpeed')?.value||5000)};
+  if(window.fbSaveSettings) window.fbSaveSettings('galerieAutoPlay',window.__galerieAutoPlay);
+  const wrap=document.getElementById('autoPlaySpeedWrap');if(wrap) wrap.style.display=on?'block':'none';
+  showToast(on?'▶️ Auto-play activé':'⏹ Désactivé','rose');
+};
+window.adminSetAutoPlaySpeed=function(ms){
+  if(window.__galerieAutoPlay) window.__galerieAutoPlay.interval=parseInt(ms);
+  if(window.fbSaveSettings) window.fbSaveSettings('galerieAutoPlay',window.__galerieAutoPlay);
+};
+window.adminToggleRemoteScroll=function(on){
+  window.__remoteControlEnabled=on;
+  if(window.fbSaveSettings) window.fbSaveSettings('remoteControl',{enabled:on});
+  showToast(on?'📡 Sync activé':'📵 Sync désactivé','rose');
+};
+
+/* ── Avant/Après ── */
+window.openAA=function(i){
+  const items=galFilter==='all'?S.galerie||[]:(S.galerie||[]).filter(item=>item.genre===galFilter);
+  const item=items[i];if(!item) return;
+  document.getElementById('aaTitle').textContent=item.label||'Galerie';
+  document.getElementById('aaApresImg').src=item.img||'';
+  if(item.avant){
+    document.getElementById('aaAvantImg').src=item.avant;
+    document.getElementById('aaOverlay').style.display='block';
+    document.getElementById('aaDivider').style.display='block';
+    document.querySelector('.aa-labels').style.display='flex';
+    initAASlider();
+  } else {
+    document.getElementById('aaOverlay').style.display='none';
+    document.getElementById('aaDivider').style.display='none';
+    document.querySelector('.aa-labels').style.display='none';
+  }
+  document.getElementById('avantApresModal').classList.add('open');
+};
+window.closeAA=function(){document.getElementById('avantApresModal').classList.remove('open');};
+function initAASlider(){
+  const wrap=document.getElementById('aaSliderWrap'),overlay=document.getElementById('aaOverlay'),divider=document.getElementById('aaDivider');
+  let dragging=false;
+  function setPos(x){const r=wrap.getBoundingClientRect();let p=((x-r.left)/r.width)*100;p=Math.max(5,Math.min(95,p));overlay.style.clipPath=`inset(0 ${100-p}% 0 0)`;divider.style.left=p+'%';}
+  divider.onmousedown=e=>{dragging=true;e.preventDefault();};
+  divider.ontouchstart=()=>{dragging=true;};
+  document.onmousemove=e=>{if(dragging) setPos(e.clientX);};
+  document.ontouchmove=e=>{if(dragging) setPos(e.touches[0].clientX);};
+  document.onmouseup=document.ontouchend=()=>{dragging=false;};
+}
+
+/* ══════════════════════════════════════
+   TICKER
+══════════════════════════════════════ */
+window.applyTicker=function(settings){
+  const bar=document.getElementById('tickerBar'),content=document.getElementById('tickerContent');
+  if(!settings||!settings.enabled){bar.classList.remove('visible');return;}
+  bar.classList.add('visible');
+  content.textContent=settings.text||'Bienvenue !';
+  content.className='ticker-content';
+  if(settings.speed==='slow') content.classList.add('speed-slow');
+  else if(settings.speed==='fast') content.classList.add('speed-fast');
+  const colors={dark:'linear-gradient(90deg,var(--dark2),#3D2527,var(--dark2))',rose:'linear-gradient(90deg,var(--rose),var(--rose2),var(--rose))',gold:'linear-gradient(90deg,var(--gold3),var(--gold),var(--gold3))',green:'linear-gradient(90deg,var(--wa2),var(--wa),var(--wa2))'};
+  bar.style.background=colors[settings.color||'dark']||colors.dark;
+  const tvTick=document.getElementById('tvTickerContent');if(tvTick) tvTick.textContent=settings.text||'';
+  const tvBar=document.getElementById('tvTickerBar');
+  if(tvBar&&document.getElementById('tvShowTicker')?.checked) tvBar.style.display=settings.enabled?'flex':'none';
+};
+window.adminSaveTicker=function(){
+  const settings={enabled:document.getElementById('tickerEnabled').checked,text:document.getElementById('tickerText').value.trim(),speed:document.getElementById('tickerSpeed').value,color:document.getElementById('tickerColor').value};
+  window.__tickerSettings=settings;
+  window.applyTicker(settings);
+  if(window.fbSaveSettings) window.fbSaveSettings('ticker',settings);
+  const prev=document.getElementById('tickerPreviewLive');if(prev) prev.textContent=settings.text||'(vide)';
+  showToast('✅ Ticker mis à jour !','green');
+};
+function populateTickerAdmin(){
+  const s=window.__tickerSettings||{};
+  document.getElementById('tickerEnabled').checked=!!s.enabled;
+  document.getElementById('tickerText').value=s.text||'';
+  document.getElementById('tickerSpeed').value=s.speed||'normal';
+  document.getElementById('tickerColor').value=s.color||'dark';
+  const prev=document.getElementById('tickerPreviewLive');if(prev) prev.textContent=s.text||'(vide)';
+}
+
+/* ══════════════════════════════════════
+   AVIS
+══════════════════════════════════════ */
+function buildAvis(){
+  const avis=S.avis||[];
+  const g=document.getElementById('avisGrid');
+  if(!avis.length){document.getElementById('avis').style.display='none';return;}
+  g.innerHTML=avis.map(a=>`<div class="avis-card"><div class="avis-stars">${'⭐'.repeat(a.note||5)}</div><div class="avis-text">"${a.texte}"</div><div class="avis-author"><div class="avis-author-dot"></div>${a.nom} ${a.genre==='m'?'🧔':a.genre==='f'?'👩':''}</div></div>`).join('');
+}
+window.openAvisModal=function(){document.getElementById('avisModal').classList.add('open');window.setNote(5);};
+window.closeAvisModal=function(){document.getElementById('avisModal').classList.remove('open');};
+window.setNote=function(n){
+  avisNote=n;
+  document.querySelectorAll('#starPicker span').forEach((s,i)=>{s.textContent=i<n?'⭐':'☆';});
+};
+window.submitAvis=function(){
+  const nom=document.getElementById('avisNom').value.trim(),texte=document.getElementById('avisTexte').value.trim();
+  if(!nom){showToast('⚠️ Entrez votre prénom','red');return;}
+  if(!texte){showToast('⚠️ Écrivez votre avis','red');return;}
+  const msg=`Bonjour ${S.nom||'le salon'} ! Je souhaite laisser un avis :\n\n${'⭐'.repeat(avisNote)}\n"${texte}"\n— ${nom}`;
+  window.open(`https://wa.me/${S.whatsapp||''}?text=${encodeURIComponent(msg)}`,'_blank');
+  window.closeAvisModal();showToast('✅ Merci pour votre avis !','green');
+};
+
+/* ══════════════════════════════════════
+   RÉSERVATION
+══════════════════════════════════════ */
+window.openResa=function(c){
+  currentCoiffure=c;currentOptPrix='base';currentCoiffeurId=null;
+  document.getElementById('resaPreviewImg').src=c.img||'';
+  document.getElementById('resaPreviewNom').textContent=c.nom;
+  document.getElementById('resaPreviewDuree').textContent='⏱ '+(c.duree||'—');
+  updateResaPrix();
+  const hasMeches=c.prixMeches&&c.prixMeches>0;
+  const optWrap=document.getElementById('resaOptWrap'),opts=document.getElementById('resaOpts');
+  if(hasMeches){optWrap.style.display='block';opts.innerHTML=`<div class="resa-opt active" onclick="pickResaOpt(this,'base')">Sans mèches — ${Number(c.prixBase).toLocaleString('fr-FR')} F</div><div class="resa-opt" onclick="pickResaOpt(this,'meches')">Avec mèches — ${Number(c.prixMeches).toLocaleString('fr-FR')} F</div>`;}
+  else optWrap.style.display='none';
+  buildResaCoiffeurs(c.genre);
+  document.getElementById('resaModal').classList.add('open');
+  document.body.style.overflow='hidden';
+};
+function buildResaCoiffeurs(genre){
+  const coiffeurs=(window.COIFFEURS||window.COIFFEURS_DEFAULT||[]).filter(e=>e.dispo!==false&&(e.genre==='mf'||e.genre===genre||genre==='mf'));
+  const wrap=document.getElementById('resaCoiffeurs');
+  wrap.innerHTML=['<div class="resa-coif-item selected" onclick="pickCoiffeur(null,this)"><div class="rci-avatar">💇</div><span>Au choix</span></div>',
+    ...coiffeurs.map(e=>`<div class="resa-coif-item" onclick="pickCoiffeur('${e.id}',this)">${e.photo?`<img src="${e.photo}" class="rci-avatar">`:`<div class="rci-avatar">${e.emoji||'💇'}</div>`}<span>${e.nom}</span></div>`)
+  ].join('');
+}
+window.pickCoiffeur=function(id,el){document.querySelectorAll('#resaCoiffeurs .resa-coif-item').forEach(i=>i.classList.remove('selected'));if(el) el.classList.add('selected');currentCoiffeurId=id;};
+window.closeResa=function(){document.getElementById('resaModal').classList.remove('open');document.body.style.overflow='';};
+window.pickResaOpt=function(el,opt){document.querySelectorAll('#resaOpts .resa-opt').forEach(o=>o.classList.remove('active'));el.classList.add('active');currentOptPrix=opt;updateResaPrix();};
+function updateResaPrix(){
+  if(!currentCoiffure) return;
+  const prix=currentOptPrix==='meches'&&currentCoiffure.prixMeches?currentCoiffure.prixMeches:currentCoiffure.prixBase;
+  document.getElementById('resaPreviewPrix').textContent=Number(prix).toLocaleString('fr-FR')+' F CFA';
+}
+window.sendResaWA=function(){
+  const nom=document.getElementById('resaNom').value.trim(),date=document.getElementById('resaDate').value,heure=document.getElementById('resaHeure').value,note=document.getElementById('resaNote').value.trim();
+  if(!nom){showToast('⚠️ Veuillez entrer votre nom','red');return;}
+  if(!date){showToast('⚠️ Choisissez une date','red');return;}
+  const c=currentCoiffure,opt=currentOptPrix==='meches'?'avec mèches':'sans mèches';
+  const prix=currentOptPrix==='meches'&&c.prixMeches?c.prixMeches:c.prixBase;
+  const dateF=new Date(date).toLocaleDateString('fr-FR',{weekday:'long',day:'numeric',month:'long'});
+  const coiffeurNom=currentCoiffeurId?((window.COIFFEURS||window.COIFFEURS_DEFAULT||[]).find(e=>e.id===currentCoiffeurId)?.nom||''):'';
+  let msg=`Bonjour ${S.nom||'le salon'} ! 💇\n\nRéservation :\n✂️ *${c.nom}* (${opt})\n💰 Prix : ${Number(prix).toLocaleString('fr-FR')} F CFA\n📅 Date : ${dateF} à ${heure}\n`;
+  if(coiffeurNom) msg+=`👤 Coiffeur·se : ${coiffeurNom}\n`;
+  msg+=`🧑 Nom : ${nom}\n`;if(note) msg+=`📝 Note : ${note}\n`;msg+=`\nMerci ! 🙏`;
+  if(window.fbSaveResa) window.fbSaveResa({nom,coiffure:c.nom,option:opt,prix,date,heure,note,coiffeur:coiffeurNom,genre:c.genre});
+  window.open(`https://wa.me/${S.whatsapp||''}?text=${encodeURIComponent(msg)}`,'_blank');
+  window.closeResa();showToast('✅ Redirection vers WhatsApp !','green');
+};
+window.saveResaFirebase=async function(){
+  const nom=document.getElementById('resaNom').value.trim(),date=document.getElementById('resaDate').value,heure=document.getElementById('resaHeure').value,note=document.getElementById('resaNote').value.trim();
+  if(!nom){showToast('⚠️ Entrez votre nom','red');return;}
+  if(!window.fbSaveResa){showToast('⚠️ Firebase non configuré','red');return;}
+  const c=currentCoiffure,opt=currentOptPrix==='meches'?'avec mèches':'sans mèches',prix=currentOptPrix==='meches'&&c.prixMeches?c.prixMeches:c.prixBase;
+  const coiffeurNom=currentCoiffeurId?((window.COIFFEURS||[]).find(e=>e.id===currentCoiffeurId)?.nom||''):'';
+  const ok=await window.fbSaveResa({nom,coiffure:c.nom,option:opt,prix,date,heure,note,coiffeur:coiffeurNom,genre:c.genre});
+  if(ok){showToast('✅ Réservation enregistrée !','green');window.closeResa();}
+  else showToast('❌ Erreur Firebase','red');
+};
+window.openWaSalon=function(){window.open(`https://wa.me/${S.whatsapp||''}?text=${encodeURIComponent('Bonjour '+(S.nom||'')+' ! Je souhaite en savoir plus sur vos prestations.')}`,'_blank');};
+window.openDetail=function(c){
+  currentCoiffure=c;
+  document.getElementById('detailImg').src=c.img||'';
+  document.getElementById('detailNom').textContent=c.nom;
+  document.getElementById('detailDesc').textContent=c.desc||'';
+  const hasMeches=c.prixMeches&&c.prixMeches>0,genreLabel=c.genre==='f'?'👩 Femme':c.genre==='m'?'🧔 Homme':'✨ Mixte';
+  document.getElementById('detailMeta').innerHTML=`<div class="detail-pill">${c.duree||'—'}</div><div class="detail-pill">💰 À partir de ${Number(c.prixBase).toLocaleString('fr-FR')} F</div>${hasMeches?`<div class="detail-pill">🧶 Avec mèches : ${Number(c.prixMeches).toLocaleString('fr-FR')} F</div>`:''}<div class="detail-pill">${genreLabel}</div>`;
+  document.getElementById('detailOpts').innerHTML=hasMeches?`<div class="resa-opt active" onclick="pickResaOpt(this,'base')">Sans mèches</div><div class="resa-opt" onclick="pickResaOpt(this,'meches')">Avec mèches</div>`:'';
+  document.getElementById('detailModal').classList.add('open');document.body.style.overflow='hidden';
+};
+window.closeDetail=function(){document.getElementById('detailModal').classList.remove('open');document.body.style.overflow='';};
+window.openResaFromDetail=function(){window.closeDetail();if(currentCoiffure) setTimeout(()=>window.openResa(currentCoiffure),200);};
+
+/* ══════════════════════════════════════
+   LOCALISATION
+══════════════════════════════════════ */
+function buildLocalisation(){
+  document.getElementById('locAdresse').textContent=S.adresse||'';
+  document.getElementById('locHoraires').textContent=S.horaires||'';
+  document.getElementById('locMapsBtn').href=S.maps||'#';
+  document.getElementById('heroMapBtn').href=S.maps||'#';
+  const tt=document.getElementById('locTiktokBtn'),fb=document.getElementById('locFacebookBtn');
+  if(S.tiktok) tt.href=S.tiktok; else tt.style.display='none';
+  if(S.facebook) fb.href=S.facebook; else fb.style.display='none';
+}
+
+/* ══════════════════════════════════════
+   HAIRSTYLES TV
+══════════════════════════════════════ */
+function startTVClock(){
+  function tick(){const now=new Date();document.getElementById('tvClock').textContent=now.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});}
+  tick();tvClockTimer=setInterval(tick,1000);
+}
+function stopTVClock(){if(tvClockTimer){clearInterval(tvClockTimer);tvClockTimer=null;}}
+function startTVBgGallery(){
+  const gal=S.galerie||[];if(!gal.length) return;
+  const bg=document.getElementById('tvBgGallery');
+  bg.innerHTML=gal.map((item,i)=>`<div class="tv-bg-slide${i===0?' active':''}" style="background-image:url('${item.img||''}')"></div>`).join('');
+  tvBgIndex=0;
+  tvBgSlideTimer=setInterval(()=>{
+    const slides=bg.querySelectorAll('.tv-bg-slide');if(!slides.length) return;
+    slides[tvBgIndex].classList.remove('active');
+    tvBgIndex=(tvBgIndex+1)%slides.length;
+    slides[tvBgIndex].classList.add('active');
+  },6000);
+}
+function stopTVBgGallery(){if(tvBgSlideTimer){clearInterval(tvBgSlideTimer);tvBgSlideTimer=null;}}
+function loadTVPlaylist(){renderTVPlaylist(window.__tvPlaylist||[]);if((window.__tvPlaylist||[]).length) tvLoadTrack(0);}
+function renderTVPlaylist(playlist){
+  const el=document.getElementById('tvPlaylistItems');
+  if(!playlist.length){el.innerHTML='<div style="padding:20px 14px;font-size:.75rem;color:rgba(255,255,255,.3);text-align:center">Playlist vide.<br>Ajoutez des médias depuis l\'admin.</div>';return;}
+  el.innerHTML=playlist.map((t,i)=>`<div class="tv-pl-item${i===tvIndex?' active':''}" onclick="tvLoadTrack(${i})"><div class="tv-pl-num">${i+1}</div><div class="tv-pl-info"><div class="tv-pl-title">${t.title||'Piste '+(i+1)}</div><div class="tv-pl-url">${t.type==='video'?'🎬':'🎵'} ${(t.url||'').substring(0,40)}</div></div></div>`).join('');
+}
+function tvLoadTrack(index){
+  const playlist=window.__tvPlaylist||[];if(!playlist.length) return;
+  tvIndex=Math.max(0,Math.min(playlist.length-1,index));
+  const track=playlist[tvIndex];if(!track) return;
+  document.querySelectorAll('.tv-pl-item').forEach((el,i)=>el.classList.toggle('active',i===tvIndex));
+  document.getElementById('tvTrackTitleDisp').textContent=track.title||'Piste '+(tvIndex+1);
+  document.getElementById('tvTrackSub').textContent=track.type==='video'?'📺 Vidéo':'🎵 Audio';
+  document.getElementById('tvProgressFill').style.width='0%';
+  const video=document.getElementById('tvVideo'),audio=document.getElementById('tvAudio');
+  video.pause();audio.pause();
+  const videoWrap=document.getElementById('tvVideoWrap');
+  if(track.type==='video'){
+    videoWrap.style.display='flex';video.src=track.url;
+    video.volume=parseInt(document.getElementById('tvVolSlider').value)/100;
+    video.play().then(()=>{tvIsPlaying=true;updateTVPlayBtn();}).catch(()=>{});
+    video.ontimeupdate=()=>{if(video.duration) document.getElementById('tvProgressFill').style.width=(video.currentTime/video.duration*100)+'%';};
+    video.onended=()=>window.tvNext();
+  } else {
+    videoWrap.style.display='none';audio.src=track.url;
+    audio.volume=parseInt(document.getElementById('tvVolSlider').value)/100;
+    audio.play().then(()=>{tvIsPlaying=true;updateTVPlayBtn();}).catch(()=>{});
+    audio.ontimeupdate=()=>{if(audio.duration) document.getElementById('tvProgressFill').style.width=(audio.currentTime/audio.duration*100)+'%';};
+    audio.onended=()=>window.tvNext();
+  }
+  resetTVInactivity();
+}
+window.tvLoadTrack=tvLoadTrack;
+function updateTVPlayBtn(){
+  const ico=document.getElementById('tvPlayIco');
+  if(ico) ico.innerHTML=tvIsPlaying?'<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>':'<path d="M8 5v14l11-7z"/>';
+}
+function setupTVInactivity(){resetTVInactivity();}
+function resetTVInactivity(){
+  clearTVInactivity();
+  if(!document.getElementById('tvScreensaver')?.checked) return;
+  tvInactivityTimer=setTimeout(()=>{document.getElementById('tvScreensaver')?.classList.add('show');},5*60*1000);
+}
+function clearTVInactivity(){if(tvInactivityTimer){clearTimeout(tvInactivityTimer);tvInactivityTimer=null;}}
+document.addEventListener('DOMContentLoaded',()=>{
+  const tvM=document.getElementById('tvModal');
+  if(tvM) tvM.addEventListener('click',()=>{document.getElementById('tvScreensaver')?.classList.remove('show');resetTVInactivity();});
+});
+function generateQR(){
+  const url=encodeURIComponent(window.location.href.split('?')[0]);
+  const img=new Image();img.crossOrigin='anonymous';
+  img.src=`https://api.qrserver.com/v1/create-qr-code/?size=64x64&data=${url}`;
+  img.onload=()=>{
+    const canvas=document.getElementById('tvQrCanvas');
+    if(!canvas) return;
+    const ctx=canvas.getContext('2d');canvas.width=64;canvas.height=64;ctx.drawImage(img,0,0,64,64);
+    document.getElementById('tvQrFloat')?.classList.add('show');
+  };
+}
+function tvSetVolume(val){
+  const v=parseInt(val)/100;
+  document.getElementById('tvVideo').volume=v;
+  document.getElementById('tvAudio').volume=v;
+}
+window.tvSetVolume=tvSetVolume;
+
+function renderAdminTVList(){
+  const pl=window.__tvPlaylist||[];
+  const el=document.getElementById('adminTVList');
+  if(!pl.length){el.innerHTML='<p style="color:rgba(255,255,255,.35);text-align:center;padding:28px;font-size:.8rem">Aucune piste. Ajoutez des médias ci-dessus.</p>';return;}
+  el.innerHTML=pl.map((t,i)=>`<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.08);border-radius:10px;margin-bottom:8px;background:rgba(255,255,255,.03)"><div style="font-size:1.2rem;flex-shrink:0">${t.type==='video'?'🎬':'🎵'}</div><div style="flex:1;min-width:0"><div style="color:#fff;font-size:.84rem;font-weight:700">${t.title||'Piste '+(i+1)}</div><div style="color:rgba(255,255,255,.35);font-size:.65rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${t.url||''}</div></div><button onclick="adminDeleteTVTrack(${i})" style="background:rgba(192,57,43,.12);border:1.5px solid rgba(192,57,43,.25);color:#e57373;border-radius:8px;padding:5px 10px;font-size:.72rem;cursor:pointer">🗑️</button></div>`).join('');
+}
+
+function adminAddTVTrack(){
+  const title=document.getElementById('tvTrackTitle').value.trim();
+  const url=document.getElementById('tvTrackUrl').value.trim();
+  const type=document.getElementById('tvTrackType').value;
+  if(!url){showToast('⚠️ URL obligatoire','red');return;}
+  if(!url.match(/^https?:\/\/.+/)){showToast('⚠️ URL invalide','red');return;}
+  if(!window.__tvPlaylist) window.__tvPlaylist=[];
+  window.__tvPlaylist.push({title:title||'Piste '+(window.__tvPlaylist.length+1),url,type});
+  if(window.fbSaveTVPlaylist) window.fbSaveTVPlaylist(window.__tvPlaylist);
+  renderAdminTVList();renderTVPlaylist(window.__tvPlaylist);
+  document.getElementById('tvTrackTitle').value='';document.getElementById('tvTrackUrl').value='';
+  showToast('✅ Piste ajoutée !','green');
+}
+window.adminAddTVTrack=adminAddTVTrack;
+
+function adminToggleQueue(on){
+  document.getElementById('queueSection')?.classList.toggle('show',on);
+  if(on&&window.fbListenQueue){if(queueUnsub) queueUnsub();queueUnsub=window.fbListenQueue(renderQueueList);}
+  else if(!on&&queueUnsub){queueUnsub();queueUnsub=null;}
+  if(window.fbSaveSettings) window.fbSaveSettings('queueEnabled',on);
+}
+window.adminToggleQueue=adminToggleQueue;
+
+/* ══════════════════════════════════════
+   FILE D'ATTENTE
+══════════════════════════════════════ */
+function renderQueueList(list){
+  const el=document.getElementById('queueList'),badge=document.getElementById('queueCountBadge');
+  const waiting=list.filter(i=>i.statut==='attente');
+  if(badge) badge.textContent=waiting.length;
+  if(!list.length){el.innerHTML='<div class="queue-empty">Aucun client en attente pour le moment.</div>';return;}
+  el.innerHTML=list.map((item,i)=>`<div class="queue-item"><div class="queue-pos ${item.statut==='en_cours'?'en_cours':''}">${i+1}</div><div class="queue-info"><div class="queue-name">${item.nom}</div><div class="queue-detail">${item.service||'—'}</div></div><span class="queue-status ${item.statut==='en_cours'?'en_cours':'attente'}">${item.statut==='en_cours'?'⚡ En cours':'⏳ Attente'}</span></div>`).join('');
+  renderAdminQueue(list);
+  const dq=document.getElementById('dQueue');if(dq) dq.textContent=waiting.length;
+}
+function renderAdminQueue(list){
+  const el=document.getElementById('adminQueueList');if(!el) return;
+  if(!list.length){el.innerHTML='<p style="color:rgba(255,255,255,.35);text-align:center;padding:28px;font-size:.8rem">File vide.</p>';return;}
+  el.innerHTML=list.map((item,i)=>`<div class="queue-admin-item"><div><div class="queue-admin-name">${i+1}. ${item.nom}</div><div class="queue-admin-detail">${item.service||'—'}</div></div><div class="queue-admin-btns">${item.statut==='attente'?`<button onclick="adminQueueStatus('${item.id}','en_cours')" style="background:rgba(41,182,246,.15);border:1.5px solid rgba(41,182,246,.3);color:#29b6f6;border-radius:8px;padding:5px 10px;font-size:.7rem;font-weight:700;cursor:pointer">⚡ Appeler</button>`:`<button onclick="adminQueueStatus('${item.id}','attente')" style="background:rgba(230,126,34,.1);border:1.5px solid rgba(230,126,34,.3);color:#f39c12;border-radius:8px;padding:5px 10px;font-size:.7rem;cursor:pointer">⏳ Attente</button>`}<button onclick="adminQueueDelete('${item.id}')" style="background:rgba(192,57,43,.12);border:1.5px solid rgba(192,57,43,.25);color:#e57373;border-radius:8px;padding:5px 10px;font-size:.72rem;cursor:pointer">🗑️</button></div></div>`).join('');
+}
+
+/* ══════════════════════════════════════
+   ADMIN — RÉSERVATIONS
+══════════════════════════════════════ */
+function loadAdminResas(){
+  if(!window.fbListenResa){document.getElementById('resaList').innerHTML='<p style="color:rgba(255,255,255,.3);text-align:center;padding:32px">Firebase non configuré.</p>';return;}
+  if(resaUnsub) return;
+  resaUnsub=window.fbListenResa(list=>{allResas=list;renderResaList();});
+}
+function renderResaList(){
+  const filtered=resaFilter==='toutes'?allResas:allResas.filter(r=>r.statut===resaFilter);
+  const el=document.getElementById('resaList');
+  if(!filtered.length){el.innerHTML='<p style="color:rgba(255,255,255,.3);font-size:.82rem;text-align:center;padding:32px">Aucune réservation pour ce filtre.</p>';return;}
+  el.innerHTML=filtered.map(r=>{
+    const d=r.createdAt?.seconds?new Date(r.createdAt.seconds*1000):null;
+    const heure=d?d.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}):'--:--';
+    const dateS=d?d.toLocaleDateString('fr-FR',{day:'2-digit',month:'2-digit'}):'';
+    const statut=r.statut||'en_attente';
+    const statutL={en_attente:'⏳ En attente',en_cours:'⚡ En cours',termine:'✅ Terminé'};
+    return `<div class="resa-card${statut==='en_attente'?' new':''}"><div class="resa-card-top"><div><div class="resa-card-name">👤 ${r.nom||'—'}</div><div class="resa-card-coif">✂️ ${r.coiffure||'—'} ${r.option?'· '+r.option:''}</div>${r.coiffeur?`<div class="resa-card-detail">💇 ${r.coiffeur}</div>`:''}${r.prix?`<div class="resa-card-detail">💰 ${Number(r.prix).toLocaleString('fr-FR')} F CFA</div>`:''}${r.date?`<div class="resa-card-detail">📅 ${r.date} ${r.heure?'à '+r.heure:''}</div>`:''}${r.note?`<div class="resa-card-detail">📝 ${r.note}</div>`:''}</div><div style="text-align:right"><div class="statut-badge ${statut}">${statutL[statut]||statut}</div><div class="resa-card-time">${heure} ${dateS}</div></div></div><div class="statut-btns"><button class="s-btn attente" onclick="changeStatut('${r.id}','en_attente')">⏳ En attente</button><button class="s-btn cours" onclick="changeStatut('${r.id}','en_cours')">⚡ En cours</button><button class="s-btn termine" onclick="changeStatut('${r.id}','termine')">✅ Terminé</button></div></div>`;
+  }).join('');
+}
+
+/* ══════════════════════════════════════
+   ADMIN — CATALOGUE
+══════════════════════════════════════ */
+function renderAdminCatalog(){
+  const source=window.__fbCoiffures||window.COIFFURES_DEFAULT||[];
+  const el=document.getElementById('adminCatList');
+  el.innerHTML=source.map(c=>`<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.08);border-radius:10px;margin-bottom:8px;background:rgba(255,255,255,.03)"><img src="${c.img||''}" style="width:42px;height:42px;border-radius:8px;object-fit:cover;background:rgba(255,255,255,.1);flex-shrink:0" onerror="this.src='https://placehold.co/42x42/2C2527/B87C74?text=?'"/><div style="flex:1;min-width:0"><div style="color:#fff;font-size:.84rem;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.nom}</div><div style="color:rgba(255,255,255,.4);font-size:.7rem">${c.cat} · ${c.genre==='f'?'👩':c.genre==='m'?'🧔':'✨'} · ${Number(c.prixBase).toLocaleString('fr-FR')} F</div></div><div style="display:flex;gap:6px"><button onclick='editCoiffure(${JSON.stringify(c)})' style="background:rgba(184,124,116,.15);border:1.5px solid rgba(184,124,116,.3);color:var(--rose2);border-radius:8px;padding:5px 10px;font-size:.72rem;cursor:pointer">✏️</button><button onclick="deleteCoiffure('${c.id}')" style="background:rgba(192,57,43,.12);border:1.5px solid rgba(192,57,43,.25);color:#e57373;border-radius:8px;padding:5px 10px;font-size:.72rem;cursor:pointer">🗑️</button></div></div>`).join('');
+}
+
+/* ══════════════════════════════════════
+   ADMIN — ÉQUIPE
+══════════════════════════════════════ */
+function renderAdminEquipe(){
+  const coiffeurs=window.COIFFEURS||window.COIFFEURS_DEFAULT||[];
+  const el=document.getElementById('adminEqList');
+  if(!coiffeurs.length){el.innerHTML='<p style="color:rgba(255,255,255,.35);text-align:center;padding:32px;font-size:.8rem">Aucun coiffeur.</p>';return;}
+  el.innerHTML=coiffeurs.map((e,i)=>`<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.08);border-radius:10px;margin-bottom:8px;background:rgba(255,255,255,.03)"><div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,var(--rose3),var(--rose2));display:flex;align-items:center;justify-content:center;font-size:1.3rem;flex-shrink:0">${e.emoji||'💇'}</div><div style="flex:1;min-width:0"><div style="color:#fff;font-size:.84rem;font-weight:700">${e.nom}</div><div style="color:rgba(255,255,255,.4);font-size:.7rem">${e.specialite||''}</div></div><div style="display:flex;gap:6px"><button onclick="editCoiffeur(${i})" style="background:rgba(184,124,116,.15);border:1.5px solid rgba(184,124,116,.3);color:var(--rose2);border-radius:8px;padding:5px 10px;font-size:.72rem;cursor:pointer">✏️</button><button onclick="deleteCoiffeur(${i})" style="background:rgba(192,57,43,.12);border:1.5px solid rgba(192,57,43,.25);color:#e57373;border-radius:8px;padding:5px 10px;font-size:.72rem;cursor:pointer">🗑️</button></div></div>`).join('');
+}
+
+/* ══════════════════════════════════════
+   ADMIN — GALERIE (Firestore)
+══════════════════════════════════════ */
+function renderAdminGalerie(){
+  const gal=S.galerie||[];const el=document.getElementById('adminGalList');
+  if(!gal.length){el.innerHTML='<p style="color:rgba(255,255,255,.35);text-align:center;padding:32px;font-size:.8rem">Aucune photo.</p>';return;}
+  el.innerHTML=gal.map((item,i)=>`<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.08);border-radius:10px;margin-bottom:8px;background:rgba(255,255,255,.03)"><img src="${item.img||''}" style="width:52px;height:52px;border-radius:8px;object-fit:cover;flex-shrink:0" onerror="this.src='https://placehold.co/52x52/2C2527/B87C74?text=?'"/><div style="flex:1;min-width:0"><div style="color:#fff;font-size:.84rem;font-weight:600">${item.label||'Photo'} ${item.avant?'🔄':''}</div><div style="color:rgba(255,255,255,.35);font-size:.6rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${item.img||''}</div></div><div style="display:flex;gap:5px"><button onclick="adminMoveGalerie(${i},-1)" style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.5);border-radius:6px;padding:5px 8px;font-size:.7rem;cursor:pointer">▲</button><button onclick="adminMoveGalerie(${i},1)" style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.5);border-radius:6px;padding:5px 8px;font-size:.7rem;cursor:pointer">▼</button><button onclick="adminDeleteGalerie(${i})" style="background:rgba(192,57,43,.12);border:1.5px solid rgba(192,57,43,.25);color:#e57373;border-radius:8px;padding:5px 10px;font-size:.72rem;cursor:pointer">🗑️</button></div></div>`).join('');
+}
+window.renderAdminGalerie=renderAdminGalerie;
+window.adminAddGalerie=function(){
+  const url=document.getElementById('galUrl').value.trim(),avant=document.getElementById('galAvant').value.trim(),label=document.getElementById('galLabel').value.trim()||'Photo',genre=document.getElementById('galGenre').value;
+  if(!url){showToast('⚠️ URL obligatoire','red');return;}
+  if(!url.match(/^https?:\/\/.+/)){showToast('⚠️ URL invalide','red');return;}
+  if(!S.galerie) S.galerie=[];
+  S.galerie.push({img:url,avant:avant||'',label,genre});
+  if(window.fbSaveSettings) window.fbSaveSettings('galerie',S.galerie);
+  window.clearGalForm();buildGalerie();renderAdminGalerie();showToast('✅ Photo ajoutée !','green');
+};
+window.adminDeleteGalerie=function(i){
+  if(!confirm('Supprimer cette photo ?')) return;
+  S.galerie.splice(i,1);if(window.fbSaveSettings) window.fbSaveSettings('galerie',S.galerie);
+  buildGalerie();renderAdminGalerie();showToast('🗑️ Photo supprimée','rose');
+};
+window.adminMoveGalerie=function(i,dir){
+  const j=i+dir;if(j<0||j>=S.galerie.length) return;
+  [S.galerie[i],S.galerie[j]]=[S.galerie[j],S.galerie[i]];
+  if(window.fbSaveSettings) window.fbSaveSettings('galerie',S.galerie);
+  buildGalerie();renderAdminGalerie();
+};
+window.clearGalForm=function(){
+  document.getElementById('galUrl').value='';document.getElementById('galAvant').value='';
+  document.getElementById('galLabel').value='';document.getElementById('galPreviewWrap').style.display='none';
+};
+
+/* ══════════════════════════════════════
+   ADMIN — SLIDESHOW (Firestore)
+══════════════════════════════════════ */
+function renderAdminSlides(){
+  const slides=S.slides||[];const el=document.getElementById('adminSlideList');
+  if(!slides.length){el.innerHTML='<p style="color:rgba(255,255,255,.35);text-align:center;padding:32px;font-size:.8rem">Aucune photo.</p>';return;}
+  el.innerHTML=slides.map((src,i)=>`<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.08);border-radius:10px;margin-bottom:8px;background:rgba(255,255,255,.03)"><img src="${src}" style="width:72px;height:48px;border-radius:8px;object-fit:cover;flex-shrink:0" onerror="this.src='https://placehold.co/72x48/2C2527/B87C74?text=?'"/><div style="flex:1;min-width:0;color:rgba(255,255,255,.4);font-size:.62rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${src}</div><div style="display:flex;gap:5px"><button onclick="adminMoveSlide(${i},-1)" style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.5);border-radius:6px;padding:5px 8px;font-size:.7rem;cursor:pointer">▲</button><button onclick="adminMoveSlide(${i},1)" style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.5);border-radius:6px;padding:5px 8px;font-size:.7rem;cursor:pointer">▼</button><button onclick="adminDeleteSlide(${i})" style="background:rgba(192,57,43,.12);border:1.5px solid rgba(192,57,43,.25);color:#e57373;border-radius:8px;padding:5px 10px;font-size:.72rem;cursor:pointer">🗑️</button></div></div>`).join('');
+}
+window.adminAddSlide=function(){
+  const url=document.getElementById('slideUrl').value.trim();
+  if(!url){showToast('⚠️ URL obligatoire','red');return;}
+  if(!url.match(/^https?:\/\/.+/)){showToast('⚠️ URL invalide','red');return;}
+  if(!S.slides) S.slides=[];
+  if(S.slides.length>=8){showToast('⚠️ Maximum 8 photos','red');return;}
+  S.slides.push(url);
+  if(window.fbSaveSettings) window.fbSaveSettings('slides',S.slides);
+  document.getElementById('slideUrl').value='';document.getElementById('slidePreviewWrap').style.display='none';
+  buildHero();renderAdminSlides();showToast('✅ Photo ajoutée !','green');
+};
+window.adminDeleteSlide=function(i){
+  if(!confirm('Retirer cette photo ?')) return;
+  S.slides.splice(i,1);if(window.fbSaveSettings) window.fbSaveSettings('slides',S.slides);
+  slideIndex=0;buildHero();renderAdminSlides();showToast('🗑️ Photo retirée','rose');
+};
+window.adminMoveSlide=function(i,dir){
+  const j=i+dir;if(j<0||j>=S.slides.length) return;
+  [S.slides[i],S.slides[j]]=[S.slides[j],S.slides[i]];
+  if(window.fbSaveSettings) window.fbSaveSettings('slides',S.slides);
+  slideIndex=0;buildHero();renderAdminSlides();
+};
+
+/* ══════════════════════════════════════
+   DASHBOARD STATS
+══════════════════════════════════════ */
+function startDashboardStats(){
+  if(!window.fbListenStats) return;
+  if(statsUnsub) statsUnsub();
+  statsUnsub=window.fbListenStats(stats=>{
+    const dt=document.getElementById('dTotal');if(dt) dt.textContent=stats.total;
+    const dd=document.getElementById('dToday');if(dd) dd.textContent=stats.today;
+    const da=document.getElementById('dAttente');if(da) da.textContent=stats.enAttente;
+    const topCoif=Object.entries(stats.coiffeurs).sort((a,b)=>b[1]-a[1]).slice(0,5);
+    const elC=document.getElementById('dashTopCoiffeurs');
+    if(elC) elC.innerHTML=topCoif.length?topCoif.map(([n,c])=>`<div class="top-list-item"><span class="top-list-name">💇 ${n}</span><span class="top-list-count">${c} RDV</span></div>`).join(''):'<p style="color:rgba(255,255,255,.3);font-size:.78rem">Aucune donnée.</p>';
+    const topPrest=Object.entries(stats.prestations).sort((a,b)=>b[1]-a[1]).slice(0,5);
+    const elP=document.getElementById('dashTopPrestations');
+    if(elP) elP.innerHTML=topPrest.length?topPrest.map(([n,c])=>`<div class="top-list-item"><span class="top-list-name">✂️ ${n}</span><span class="top-list-count">${c} fois</span></div>`).join(''):'<p style="color:rgba(255,255,255,.3);font-size:.78rem">Aucune donnée.</p>';
+  });
+}
+
+/* ══════════════════════════════════════
+   NOTIFICATIONS WA
+══════════════════════════════════════ */
+const NOTIF_TEMPLATES={
+  promo:()=>`🎉 *Promotion spéciale ${S.nom||'le salon'}* !\n\nNous vous offrons une réduction exceptionnelle cette semaine.\n\n📞 Réservez dès maintenant !\n\n✂️ ${S.nom||'Le salon'} — ${S.adresse||''}`,
+  rappel:()=>`⏰ *Rappel de rendez-vous*\n\nBonjour,\nNous vous rappelons votre rendez-vous prévu.\n\n📍 ${S.adresse||''}\n🕐 ${S.horaires||''}`,
+  nouveau:()=>`✨ *Nouvelle prestation disponible !*\n\nChers clients, ${S.nom||'le salon'} annonce une nouvelle prestation.\n\nRéservez dès maintenant ! 📲`,
+  ferme:()=>`🔒 *Fermeture exceptionnelle*\n\nNous serons fermés le [DATE].\nNous nous excusons pour la gêne.\n\n${S.nom||"L'équipe du salon"}`,
+  libre:()=>''
+};
+window.updateNotifTemplate=function(){
+  const type=document.getElementById('notifType')?.value;
+  const tpl=NOTIF_TEMPLATES[type];
+  if(tpl){const el=document.getElementById('notifMsg');if(el){el.value=tpl();updateNotifPreview();}}
+};
+function updateNotifPreview(){
+  const msg=document.getElementById('notifMsg')?.value||'';
+  const prev=document.getElementById('notifPreview');if(prev) prev.textContent=msg;
+}
+window.sendNotifWA=function(){
+  const msg=document.getElementById('notifMsg').value.trim();
+  if(!msg){showToast('⚠️ Message vide','red');return;}
+  window.open(`https://wa.me/${S.whatsapp||''}?text=${encodeURIComponent(msg)}`,'_blank');
+  showToast('✅ WhatsApp ouvert !','green');
+  const hist=document.getElementById('notifHistory'),cible=document.getElementById('notifCible').value,now=new Date().toLocaleString('fr-FR');
+  hist.innerHTML=`<div style="background:rgba(39,174,96,.08);border:1px solid rgba(39,174,96,.2);border-radius:var(--r-sm);padding:10px 12px;margin-bottom:8px;font-size:.72rem;color:rgba(255,255,255,.6)">✅ Envoyé le ${now} · ${cible}</div>`+hist.innerHTML;
+};
+document.addEventListener('DOMContentLoaded',()=>{const m=document.getElementById('notifMsg');if(m) m.addEventListener('input',updateNotifPreview);});
+
+/* ══════════════════════════════════════
+   TOUTES LES FONCTIONS window. ONCLICK
+══════════════════════════════════════ */
+window.openAdmin=function(){document.getElementById('pinModal').classList.add('open');setTimeout(()=>document.getElementById('pinInput').focus(),200);};
+window.closeAdmin=function(){
+  document.getElementById('adminModal').classList.remove('open');document.body.style.overflow='';
+  window.__isAdmin=false;
+  if(resaUnsub){resaUnsub();resaUnsub=null;}
+  if(statsUnsub){statsUnsub();statsUnsub=null;}
+};
+window.checkPin=function(){
+  const pin=document.getElementById('pinInput').value;
+  if(pin===(S.adminPin||'1234')){
+    window.closePin();window.__isAdmin=true;window.__adminGalerieOpen=false;
+    document.getElementById('adminModal').classList.add('open');document.body.style.overflow='hidden';
+    loadAdminResas();renderAdminCatalog();startDashboardStats();
+  } else {showToast('❌ Code incorrect','red');document.getElementById('pinInput').value='';}
+};
+window.closePin=function(){document.getElementById('pinModal').classList.remove('open');document.getElementById('pinInput').value='';};
+window.openTV=function(){
+  document.getElementById('tvModal').classList.add('open');document.body.style.overflow='hidden';
+  startTVClock();loadTVPlaylist();startTVBgGallery();setupTVInactivity();
+  const ts=window.__tickerSettings;
+  if(ts?.enabled&&document.getElementById('tvShowTicker')?.checked){
+    const bar=document.getElementById('tvTickerBar');if(bar) bar.style.display='flex';
+    const c=document.getElementById('tvTickerContent');if(c) c.textContent=ts.text||'';
+  }
+  if(document.getElementById('tvShowQr')?.checked) generateQR();
+};
+window.closeTV=function(){
+  document.getElementById('tvModal').classList.remove('open');document.body.style.overflow='';
+  stopTVClock();stopTVBgGallery();clearTVInactivity();
+  const v=document.getElementById('tvVideo');if(v){v.pause();v.src='';}
+  const a=document.getElementById('tvAudio');if(a){a.pause();a.src='';}
+  tvIsPlaying=false;
+};
+window.openJoinQueue=function(){document.getElementById('joinQueueModal').style.display='flex';};
+window.submitJoinQueue=async function(){
+  const nom=document.getElementById('queueNom').value.trim(),service=document.getElementById('queueService').value.trim();
+  if(!nom){showToast('⚠️ Entrez votre nom','red');return;}
+  if(!window.fbAddQueue){showToast('⚠️ Firebase non configuré','red');return;}
+  const ok=await window.fbAddQueue({nom,service:service||'Non précisé',statut:'attente'});
+  if(ok){document.getElementById('joinQueueModal').style.display='none';document.getElementById('queueNom').value='';document.getElementById('queueService').value='';showToast('✅ Vous êtes dans la file !','green');}
+  else showToast('❌ Erreur','red');
+};
+window.adminQueueStatus=async function(id,statut){if(window.fbUpdateQueue) await window.fbUpdateQueue(id,{statut});};
+window.adminQueueDelete=async function(id){if(window.fbDeleteQueue) await window.fbDeleteQueue(id);};
+window.adminDeleteTVTrack=function(i){
+  if(!window.__tvPlaylist) return;
+  window.__tvPlaylist.splice(i,1);
+  if(window.fbSaveTVPlaylist) window.fbSaveTVPlaylist(window.__tvPlaylist);
+  renderAdminTVList();renderTVPlaylist(window.__tvPlaylist);showToast('🗑️ Piste supprimée','rose');
+};
+window.tvTogglePlay=function(){
+  const pl=window.__tvPlaylist||[];if(!pl.length) return;
+  const track=pl[tvIndex];
+  const media=track?.type==='video'?document.getElementById('tvVideo'):document.getElementById('tvAudio');
+  if(tvIsPlaying){media.pause();tvIsPlaying=false;}else{media.play();tvIsPlaying=true;}
+  updateTVPlayBtn();resetTVInactivity();
+};
+window.tvNext=function(){const pl=window.__tvPlaylist||[];if(!pl.length) return;tvLoadTrack((tvIndex+1)%pl.length);};
+window.tvPrev=function(){const pl=window.__tvPlaylist||[];if(!pl.length) return;tvLoadTrack((tvIndex-1+pl.length)%pl.length);};
+window.tvTogglePlaylist=function(){document.getElementById('tvPlaylistPanel').classList.toggle('show');};
+window.tvToggleFullscreen=function(){
+  const el=document.getElementById('tvModal');
+  if(!document.fullscreenElement){el.requestFullscreen&&el.requestFullscreen();}
+  else{document.exitFullscreen&&document.exitFullscreen();}
+};
+window.saveCoiffure=async function(){
+  const id=document.getElementById('editId').value;
+  const coiffure={nom:document.getElementById('editNom').value.trim(),cat:document.getElementById('editCat').value,genre:document.getElementById('editGenre').value,duree:document.getElementById('editDuree').value.trim(),prixBase:Number(document.getElementById('editPrixBase').value)||0,prixMeches:Number(document.getElementById('editPrixMeches').value)||null,desc:document.getElementById('editDesc').value.trim(),img:document.getElementById('editImg').value.trim(),badge:document.getElementById('editBadge').value.trim()||null,dispo:true};
+  if(id) coiffure.id=id;
+  if(!coiffure.nom){showToast('⚠️ Nom obligatoire','red');return;}
+  if(window.fbSaveCoiffure){const ok=await window.fbSaveCoiffure(coiffure);if(ok){showToast('✅ Sauvegardée !','green');window.clearEditForm();}else showToast('❌ Erreur Firebase','red');}
+  else{const src=window.COIFFURES_DEFAULT,{id:_id,...data}=coiffure;if(id){const i=src.findIndex(c=>c.id===id);if(i>=0) src[i]={...src[i],...data};}else{data.id='c'+Date.now();src.push(data);}renderCatalog();renderAdminCatalog();showToast('✅ Modifié (local)','rose');window.clearEditForm();}
+};
+window.editCoiffure=function(c){
+  document.getElementById('editId').value=c.id||'';document.getElementById('editNom').value=c.nom||'';document.getElementById('editCat').value=c.cat||'tresses';document.getElementById('editGenre').value=c.genre||'f';document.getElementById('editDuree').value=c.duree||'';document.getElementById('editPrixBase').value=c.prixBase||'';document.getElementById('editPrixMeches').value=c.prixMeches||'';document.getElementById('editDesc').value=c.desc||'';document.getElementById('editImg').value=c.img||'';document.getElementById('editBadge').value=c.badge||'';
+  document.getElementById('editNom').scrollIntoView({behavior:'smooth'});
+};
+window.deleteCoiffure=async function(id){
+  if(!confirm('Supprimer cette coiffure ?')) return;
+  if(window.fbDeleteCoiffure){await window.fbDeleteCoiffure(id);showToast('🗑️ Supprimée','rose');}
+  else{const i=window.COIFFURES_DEFAULT.findIndex(c=>c.id===id);if(i>=0) window.COIFFURES_DEFAULT.splice(i,1);renderCatalog();renderAdminCatalog();showToast('🗑️ Supprimée (local)','rose');}
+};
+window.clearEditForm=function(){['editId','editNom','editDuree','editPrixBase','editPrixMeches','editDesc','editImg','editBadge'].forEach(id=>document.getElementById(id).value='');document.getElementById('editCat').value='tresses';document.getElementById('editGenre').value='f';};
+window.editCoiffeur=function(i){const e=(window.COIFFEURS||[])[i];if(!e) return;document.getElementById('eqId').value=e.id||'';document.getElementById('eqNom').value=e.nom||'';document.getElementById('eqGenre').value=e.genre||'f';document.getElementById('eqSpe').value=e.specialite||'';document.getElementById('eqPhoto').value=e.photo||'';document.getElementById('eqNom').scrollIntoView({behavior:'smooth'});};
+window.saveCoiffeur=function(){
+  const id=document.getElementById('eqId').value,nom=document.getElementById('eqNom').value.trim();
+  if(!nom){showToast('⚠️ Prénom obligatoire','red');return;}
+  const coiffeur={id:id||'e'+Date.now(),nom,genre:document.getElementById('eqGenre').value,specialite:document.getElementById('eqSpe').value.trim(),photo:document.getElementById('eqPhoto').value.trim(),dispo:true,emoji:document.getElementById('eqGenre').value==='m'?'👨':'👩'};
+  const list=window.COIFFEURS||window.COIFFEURS_DEFAULT||[];
+  if(id){const i=list.findIndex(e=>e.id===id);if(i>=0) list[i]={...list[i],...coiffeur};else list.push(coiffeur);}
+  else list.push(coiffeur);
+  window.COIFFEURS=list;buildEquipe();renderAdminEquipe();window.clearEqForm();showToast('✅ Enregistré·e','green');
+};
+window.deleteCoiffeur=function(i){if(!confirm('Supprimer ?')) return;(window.COIFFEURS||[]).splice(i,1);buildEquipe();renderAdminEquipe();showToast('🗑️ Supprimé·e','rose');};
+window.clearEqForm=function(){['eqId','eqNom','eqSpe','eqPhoto'].forEach(id=>document.getElementById(id).value='');document.getElementById('eqGenre').value='f';};
+window.setResaFilter=function(f,el){resaFilter=f;document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active-filter'));if(el) el.classList.add('active-filter');renderResaList();};
+window.changeStatut=async function(id,statut){if(!window.fbUpdateStatut){showToast('Firebase non connecté','red');return;}await window.fbUpdateStatut(id,statut);showToast('✅ Statut mis à jour','green');};
+window.switchAdminTab=function(tab,el){
+  document.querySelectorAll('.admin-section').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.admin-tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('tab-'+tab)?.classList.add('active');if(el) el.classList.add('active');
+  if(tab==='catalogue') renderAdminCatalog();
+  if(tab==='galerie'){window.__adminGalerieOpen=true;renderAdminGalerie();}
+  if(tab==='slides') renderAdminSlides();
+  if(tab==='equipe') renderAdminEquipe();
+  if(tab==='notifs') window.updateNotifTemplate();
+  if(tab==='ticker') populateTickerAdmin();
+  if(tab==='tv') renderAdminTVList();
+  if(tab==='queue') renderAdminQueue([]);
+  if(tab==='reservations') loadAdminResas();
+  if(tab==='dashboard') startDashboardStats();
+};
+
+/* ══════════════════════════════════════
+   ADMIN PREVIEWS
+══════════════════════════════════════ */
+function initAdminPreviews(){
+  const galInput=document.getElementById('galUrl');
+  if(galInput) galInput.addEventListener('input',()=>{const url=galInput.value.trim(),wrap=document.getElementById('galPreviewWrap'),img=document.getElementById('galPreviewImg');if(url.match(/^https?:\/\/.+/)){img.src=url;img.onerror=()=>{wrap.style.display='none';};img.onload=()=>{wrap.style.display='block';};}else wrap.style.display='none';});
+  const slideInput=document.getElementById('slideUrl');
+  if(slideInput) slideInput.addEventListener('input',()=>{const url=slideInput.value.trim(),wrap=document.getElementById('slidePreviewWrap'),img=document.getElementById('slidePreviewImg');if(url.match(/^https?:\/\/.+/)){img.src=url;img.onerror=()=>{wrap.style.display='none';};img.onload=()=>{wrap.style.display='block';};}else wrap.style.display='none';});
+  const tickerInput=document.getElementById('tickerText');
+  if(tickerInput) tickerInput.addEventListener('input',()=>{const prev=document.getElementById('tickerPreviewLive');if(prev) prev.textContent=tickerInput.value||'(vide)';});
+}
+
+/* ══════════════════════════════════════
+   TRIPLE CLIC + DARK + SCROLL + TOAST
+══════════════════════════════════════ */
+function initTripleClick(){
+  document.getElementById('brandClick').addEventListener('click',()=>{
+    clickCount++;clearTimeout(clickTimer);
+    clickTimer=setTimeout(()=>{clickCount=0;},1000);
+    if(clickCount>=3){clickCount=0;window.openAdmin();}
+  });
+}
+window.toggleDark=function(){
+  isDark=!isDark;document.documentElement.setAttribute('data-theme',isDark?'dark':'light');
+  document.getElementById('darkIco').innerHTML=isDark?'<path d="M12 3a9 9 0 100 18A9 9 0 0012 3zm0 2a7 7 0 010 14V5z"/>':'<path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58a.996.996 0 00-1.41 0 .996.996 0 000 1.41l1.06 1.06c.39.39 1.03.39 1.41 0s.39-1.03 0-1.41L5.99 4.58zm12.37 12.37a.996.996 0 00-1.41 0 .996.996 0 000 1.41l1.06 1.06c.39.39 1.03.39 1.41 0a.996.996 0 000-1.41l-1.06-1.06zm1.06-12.37l-1.06 1.06a.996.996 0 000 1.41c.39.39 1.03.39 1.41 0l1.06-1.06a.996.996 0 000-1.41-.996.996 0 00-1.41 0zM7.05 18.36l-1.06 1.06a.996.996 0 000 1.41c.39.39 1.03.39 1.41 0l1.06-1.06a.996.996 0 000-1.41-.99.99 0 00-1.41 0z"/>';
+};
+function initScrollBehaviors(){window.addEventListener('scroll',()=>{document.getElementById('scrollTop').classList.toggle('show',window.scrollY>300);});}
+let toastTimer=null;
+function showToast(msg,type=''){
+  const t=document.getElementById('toast');t.textContent=msg;t.className='show'+(type?' '+type:'');
+  clearTimeout(toastTimer);toastTimer=setTimeout(()=>{t.className='';},3200);
+}
+
+/* ══════════════════════════════════════
+   FERMER MODALS
+══════════════════════════════════════ */
+document.addEventListener('DOMContentLoaded',()=>{
+  document.getElementById('resaModal')?.addEventListener('click',e=>{if(e.target===document.getElementById('resaModal')) window.closeResa();});
+  document.getElementById('detailModal')?.addEventListener('click',e=>{if(e.target===document.getElementById('detailModal')) window.closeDetail();});
+  document.getElementById('avantApresModal')?.addEventListener('click',e=>{if(e.target===document.getElementById('avantApresModal')) window.closeAA();});
+  document.getElementById('avisModal')?.addEventListener('click',e=>{if(e.target===document.getElementById('avisModal')) window.closeAvisModal();});
+  document.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){
+      window.closeResa();window.closeDetail();window.closeAA();window.closeAvisModal();
+      if(document.getElementById('adminModal')?.classList.contains('open')) window.closeAdmin();
+      if(document.getElementById('galerieSlideshow')?.classList.contains('open')) window.closeGalerieSlideshow();
+      if(document.getElementById('tvModal')?.classList.contains('open')) window.closeTV();
+    }
+  });
+  // Swipe galerie
+  let touchStartX=0;
+  document.getElementById('galerieSlideshow')?.addEventListener('touchstart',e=>{touchStartX=e.touches[0].clientX;},{passive:true});
+  document.getElementById('galerieSlideshow')?.addEventListener('touchend',e=>{
+    const dx=e.changedTouches[0].clientX-touchStartX;
+    if(Math.abs(dx)>50){
+      if(dx<0) window.gsNext(); else window.gsPrev();
+      if(gsRemoteMode&&window.__isAdmin&&window.fbSendRemoteCmd) window.fbSendRemoteCmd({action:'gallery_goto',index:gsIndex});
+    }
+  });
+  // Firestore settings listener (playlist TV + queue)
+  setTimeout(()=>{
+    if(window.__DB&&window.__fb){
+      window.__fb.onSnapshot(window.__fb.doc(window.__DB,'salonConfig','settings'),snap=>{
+        if(!snap.exists()) return;
+        const data=snap.data();
+        if(data.tvPlaylist&&Array.isArray(data.tvPlaylist)){window.__tvPlaylist=data.tvPlaylist;renderAdminTVList();}
+        if(data.queueEnabled){
+          const tog=document.getElementById('queueEnabled');if(tog) tog.checked=true;
+          document.getElementById('queueSection')?.classList.add('show');
+          if(window.fbListenQueue&&!queueUnsub) queueUnsub=window.fbListenQueue(renderQueueList);
+        }
+      },()=>{});
+    }
+  },1200);
+});
+
+if('serviceWorker' in navigator) window.addEventListener('load',()=>{navigator.serviceWorker.register('sw.js').catch(()=>{});});
+</script>
+</body>
+</html>
